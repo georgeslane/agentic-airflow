@@ -14,6 +14,8 @@
 
 **Skill files** are loaded only from the given directory (symlinks escaping it are ignored). Skill rewrites proposed by the DagEvaluator become active only after `approve_recommendation()`.
 
+**Agent self-modification is proposal-only.** The optional MCP server and `agentic_airflow.proposals` let agents read everything and *propose* prompt, permission, skill and memory changes; they are stored as pending recommendations and only `Engine.approve_recommendation()` (a human, via code or the UI) applies them. The MCP server has no approve/decide/cancel tools, cannot trigger runs unless explicitly enabled, and agents can only withdraw their own proposals.
+
 **Human approval gates**: denied tool calls, exhausted reflection loops, and every DagEvaluator change to permissions, prompts or skills. Memory compaction is applied automatically by default because it does not change behaviourally-privileged configuration; set `DagEvaluator(apply_memory=False)` to gate it too.
 
 **Resource bounds**: `max_tool_steps` per task, `output_retries`, `max_context_chars` truncation, `max_active_runs` per DAG, per-model concurrency, bounded cron look-ahead.

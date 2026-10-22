@@ -19,6 +19,7 @@ This page is written for an AI agent (or a developer in a hurry) that needs to u
 - [ ] Handle pauses: `engine.list_approvals()` → `approve/reject/decide`.
 - [ ] Review DagEvaluator output: `run.summary`, `engine.list_recommendations()` → `approve_recommendation()`.
 - [ ] For production: `SqliteStateStore`, `UIServer(token=...)`, `engine.resume_interrupted()` at startup.
+- [ ] To let an MCP client (e.g. Claude Code) inspect DAGs and propose changes: `pip install agentic-airflow[mcp]`, then `python -m agentic_airflow.mcp myapp.workflows:engine` (see `docs/mcp.md`). Proposals are pending until a human approves.
 
 ## Where to look
 
@@ -32,6 +33,8 @@ This page is written for an AI agent (or a developer in a hurry) that needs to u
 | Add persistence backend | implement `state.StateStore` (see `InMemoryStateStore`) |
 | Add an API route | `ui/server.py::_Handler._api_get/_api_post` |
 | Change the DagEvaluator prompts/schemas | `evaluator.py` |
+| Add a proposal type (human-gated change) | `proposals.py` (+ `evaluator.apply_recommendation` to apply it, `mcp/__init__.py` to expose it) |
+| Add an MCP tool | `mcp/__init__.py::build_server` (inspection or proposal only; never approve/apply) |
 
 ## Invariants to preserve
 

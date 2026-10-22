@@ -35,6 +35,7 @@ async with engine:                       # starts the cron scheduler
 ```bash
 pip install -e .            # core: zero runtime dependencies, Python >= 3.10
 pip install -e .[anthropic] # optional Claude backend
+pip install -e .[mcp]       # optional MCP server for agent self-inspection
 pip install -e .[dev]       # pytest
 python -m pytest
 ```
@@ -54,6 +55,7 @@ python -m pytest
 | **DagEvaluator** | Five-task group auto-attached to terminal nodes: critique, tool audit, skill rewriter, memory compactor, executive summary. Recommendations are staged and only applied after `approve_recommendation()`. |
 | **Persistence** | `InMemoryStateStore` or `SqliteStateStore` (stdlib). Runs, checkpoints, approvals, memory, skill versions and overrides survive restarts; `resume_interrupted()` picks up where a process died. |
 | **UI** | `engine.graph()` JSON, `render_html()` self-contained page, `render_embed()` fragment, optional `UIServer` (stdlib HTTP, bearer token, CSP). |
+| **MCP server** (`[mcp]` extra) | Lets an external agent inspect its DAGs (settings, runs, outputs, logs) and *propose* prompt, permission, skill and memory changes that a human must approve. No approve/apply tools exist on the server. |
 
 ## Documentation
 
@@ -61,6 +63,7 @@ python -m pytest
 * [Plugging in your agent framework](docs/plugging_in.md): backends, tools, skills, events, chat sink, state stores.
 * [Architecture](docs/architecture.md): how a run executes, statuses, the expansion algorithm, the priority queue.
 * [Graph UI & HTTP API](docs/ui.md).
+* [MCP server](docs/mcp.md): agent self-inspection and human-gated proposals.
 * [Security model](docs/security.md).
 * [Spec deviations & design decisions](docs/spec_deviations.md): where the implementation adjusts the original spec and why.
 * [Agent guide](docs/agent_guide.md): a compact orientation for another AI agent that needs to integrate with or extend the library.
