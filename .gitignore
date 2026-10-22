@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# agentic-airflow examples
+examples/*.db*
+examples/run_graph.html
