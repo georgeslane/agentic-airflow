@@ -24,7 +24,8 @@ dependencies = []
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40"]
-dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+mcp = ["mcp>=1.2"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "mcp>=1.2"]
 
 [project.urls]
 Homepage = "https://github.com/georgeslane/agentic-airflow"

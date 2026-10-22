@@ -5,3 +5,4 @@
 * Start with `docs/agent_guide.md` for orientation; `docs/architecture.md` explains the run driver and the node expansion algorithm; `docs/spec_deviations.md` records deliberate departures from the original spec. Update those docs when you change behaviour.
 * All persisted state must stay JSON-serialisable (`DagRun.to_dict()` / `from_dict()`).
 * Security rules in `docs/security.md` are load-bearing: permission checks live in the engine, never only in prompts.
+* The MCP server (`agentic_airflow/mcp`, optional `[mcp]` extra) must stay inspection + proposal only: never add a tool that approves, applies, decides or cancels. Human approval goes through `Engine.approve_recommendation` / the UI.
