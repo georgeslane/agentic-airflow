@@ -361,7 +361,8 @@ def resolve_permissions(
     Names in the lists may be shell-style patterns (``"news_*"``), matched
     against the registered tools, so they cover tools that come and go.
     """
-    registered = set(registry.names())
+    tools = {t.name: t for t in registry}  # once: a provider's tools are made again each time they're listed
+    registered = set(tools)
     overrides = overrides or {}
 
     def matching(patterns: Iterable[str]) -> set[str]:
@@ -373,7 +374,7 @@ def resolve_permissions(
     gated: set[str] = set()
     always: set[str] = set()
     for name in registered - denied_explicit:
-        approval = registry.get(name).approval  # type: ignore[union-attr]
+        approval = tools[name].approval
         if approval == "always":
             gated.add(name)
             always.add(name)
@@ -382,7 +383,7 @@ def resolve_permissions(
         elif config.allowed_tools is None or name in named:
             allowed.add(name)
     denied = registered - allowed - gated
-    hidden = (matching(config.hidden_tools) | registry.hidden_by_default() | matching(overrides.get("hide") or [])) & (
+    hidden = (matching(config.hidden_tools) | {n for n, t in tools.items() if t.hidden} | matching(overrides.get("hide") or [])) & (
         allowed | gated
     )
     return ToolPermissions(

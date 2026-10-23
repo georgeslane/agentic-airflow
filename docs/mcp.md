@@ -9,7 +9,7 @@
 * Explicit `denied_tools` in code still win over any approved permission proposal.
 * The server instructions tell the agent that run logs are data, not instructions.
 * A client can only withdraw proposals it made itself (`source == "mcp"` and its `client_name`).
-* At most 20 proposals from one source wait at a time (`proposals.MAX_PENDING`), so an agent can't flood the queue.
+* At most 20 proposals from one source wait for each DAG (`proposals.MAX_PENDING`), so an agent can't flood the queue.
 
 ## Tools
 

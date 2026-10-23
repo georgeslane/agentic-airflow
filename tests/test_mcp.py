@@ -184,7 +184,7 @@ async def test_clients_withdraw_only_their_own_and_cant_flood_the_queue(engine_w
     for n in range(MAX_PENDING):
         assert (await call(mine, "propose_structural_change", dag_id="insp", description=f"Step {n}", rationale="r"))["ok"]
     flood = await call(other, "propose_structural_change", dag_id="insp", description="One more", rationale="r")
-    assert flood["ok"] is False and "waiting already" in flood["error"]
+    assert flood["ok"] is False and "waiting for 'insp' already" in flood["error"]
 
 
 @pytest.mark.asyncio

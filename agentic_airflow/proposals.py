@@ -22,15 +22,15 @@ if TYPE_CHECKING:  # pragma: no cover
 
 MAX_RATIONALE = 4000
 MAX_PROMPT = 50_000
-MAX_PENDING = 20  # from one source: withdraw or decide some before proposing more
+MAX_PENDING = 20  # from one source, for one DAG: withdraw or decide some before proposing more
 
 
 def _store(engine: "Engine", *, dag_id: str | None, kind: str, title: str, payload: dict[str, Any], rationale: str, source: str, proposed_by: str | None) -> dict[str, Any]:
     if not isinstance(rationale, str) or not rationale.strip():
         raise ConfigurationError("A rationale is required for every proposal")
-    waiting = [r for r in engine.state.list_recommendations(status="pending") if r.get("source") == source]
+    waiting = [r for r in engine.state.list_recommendations(dag_id=dag_id, status="pending") if r.get("source") == source]
     if len(waiting) >= MAX_PENDING:
-        raise ConfigurationError(f"{len(waiting)} proposals from {source!r} are waiting already: withdraw some, or wait for a human to decide them")
+        raise ConfigurationError(f"{len(waiting)} proposals from {source!r} are waiting for {dag_id!r} already: withdraw some, or wait for a human to decide them")
     rec = {
         "id": f"rec_{uuid.uuid4().hex[:12]}",
         "run_id": None,

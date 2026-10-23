@@ -14,7 +14,7 @@
 
 **Skill files** are loaded only from the given directory (symlinks escaping it are ignored). Skill rewrites proposed by the DagEvaluator become active only after `approve_recommendation()`.
 
-**Agent self-modification is proposal-only.** The optional MCP server and `agentic_airflow.proposals` let agents read everything and *propose* prompt, permission, skill and memory changes; they are stored as pending recommendations and only `Engine.approve_recommendation()` (a human, via code or the UI) applies them. The MCP server has no approve/decide/cancel tools, cannot trigger runs unless explicitly enabled, and each client can only withdraw its own proposals. At most 20 proposals from one source wait at a time.
+**Agent self-modification is proposal-only.** The optional MCP server and `agentic_airflow.proposals` let agents read everything and *propose* prompt, permission, skill and memory changes; they are stored as pending recommendations and only `Engine.approve_recommendation()` (a human, via code or the UI) applies them. The MCP server has no approve/decide/cancel tools, cannot trigger runs unless explicitly enabled, and each client can only withdraw its own proposals. At most 20 proposals from one source wait for each DAG.
 
 **Stored state is versioned.** `SqliteStateStore` records its schema in the file, upgrades older files when it opens them, and refuses one written by a newer version rather than misread it.
 
