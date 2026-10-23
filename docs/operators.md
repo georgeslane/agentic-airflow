@@ -89,6 +89,7 @@ Resolution per task (`tools.resolve_permissions`):
 * `denied_tools` accumulate across scopes and always win (also over human-approved `allow` overrides).
 * A tool registered with `approval="ask"` is **gated** (offered to the model, but each call pauses for approval) unless some scope's `allowed_tools` (or an `allow` override) names it; `allowed_tools=None` doesn't count as naming it. One with `approval="always"` is gated whatever `allowed_tools` says, and approving it with `remember=True` doesn't allow it for the rest of the run.
 * `hidden_tools` accumulate; a hidden tool is allowed but its schema is not injected until the agent calls the built-in `search_tools` tool. Tools registered with `hidden=True` are hidden everywhere by default.
+* With an `allowed_tools` list, gated tools it doesn't name are hidden too: the task finds one with `search_tools` when it needs it, and each call still pauses for approval. So a list is the tools a task is given; without one, every gated tool is offered, as before.
 * Anything registered but not allowed is **denied**: calling it serialises the conversation, puts the instance in `AWAITING_TOOL_APPROVAL`, releases the model slot and creates an `Approval`. `engine.approve(id, remember=True)` executes it (and allows it for the rest of the run); `engine.reject(id, reason)` injects a denial message so the agent adjusts.
 * Unknown (unregistered) tool names produce an error message to the model, not a pause.
 * Tool arguments are validated against the tool's JSON schema before execution.
