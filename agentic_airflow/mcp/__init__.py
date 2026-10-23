@@ -141,7 +141,7 @@ def build_server(engine: Any, *, name: str = "agentic-airflow", allow_trigger: b
             data = op.describe()
             data["resolved"] = engine.resolved_config(dag_id, op.id)
             if op.is_agentic:
-                data["effective_prompt"] = (overrides.get("prompts") or {}).get(op.id) or op.prompt
+                data["effective_prompt"] = (overrides.get("prompts") or {}).get(op.id) or op.prompt_text
             tasks.append(data)
         return {
             "dag_id": dag.id, "prompt": dag.prompt, "description": dag.description, "tags": list(dag.tags),
@@ -239,9 +239,9 @@ def build_server(engine: Any, *, name: str = "agentic-airflow", allow_trigger: b
     async def propose_structural_change(dag_id: str, description: str, rationale: str) -> dict[str, Any]:
         return await wrap(proposals.propose_structural_change)(engine, dag_id, description, rationale, source=SOURCE, proposed_by=client_name)
 
-    @server.tool(description="Propose DAG-level tool permission overrides: allow (grant without approval), hide (keep on-demand), deny (block). Pending until a human approves; explicit denied_tools in code always win.")
-    async def propose_tool_permissions(dag_id: str, rationale: str, allow: list[str] | None = None, hide: list[str] | None = None, deny: list[str] | None = None) -> dict[str, Any]:
-        return await wrap(proposals.propose_tool_permissions)(engine, dag_id, allow=allow, hide=hide, deny=deny, rationale=rationale, source=SOURCE, proposed_by=client_name)
+    @server.tool(description="Propose DAG-level tool permission overrides: allow (grant without approval), hide (keep on-demand), deny (block), or unset (drop an earlier override of a tool). Pending until a human approves; explicit denied_tools in code always win.")
+    async def propose_tool_permissions(dag_id: str, rationale: str, allow: list[str] | None = None, hide: list[str] | None = None, deny: list[str] | None = None, unset: list[str] | None = None) -> dict[str, Any]:
+        return await wrap(proposals.propose_tool_permissions)(engine, dag_id, allow=allow, hide=hide, deny=deny, unset=unset, rationale=rationale, source=SOURCE, proposed_by=client_name)
 
     @server.tool(description="Propose a new version of a skill (full replacement text) or a new skill. Pending until a human approves.")
     async def propose_skill_rewrite(skill: str, content: str, rationale: str, dag_id: str | None = None) -> dict[str, Any]:
@@ -251,9 +251,9 @@ def build_server(engine: Any, *, name: str = "agentic-airflow", allow_trigger: b
     async def propose_memory_update(dag_id: str, memory: dict[str, Any], rationale: str) -> dict[str, Any]:
         return await wrap(proposals.propose_memory_update)(engine, dag_id, memory, rationale, source=SOURCE, proposed_by=client_name)
 
-    @server.tool(description="Withdraw one of YOUR pending proposals (proposals from other sources cannot be withdrawn here).")
+    @server.tool(description="Withdraw one of YOUR pending proposals (those of other sources and other clients cannot be withdrawn here).")
     async def withdraw_proposal(recommendation_id: str, reason: str = "") -> dict[str, Any]:
-        return await wrap(proposals.withdraw_proposal)(engine, recommendation_id, source=SOURCE, reason=reason)
+        return await wrap(proposals.withdraw_proposal)(engine, recommendation_id, source=SOURCE, proposed_by=client_name, reason=reason)
 
     if allow_trigger:
         @server.tool(description="Trigger a run of a DAG with an optional JSON payload (enabled by the operator).")

@@ -8,7 +8,8 @@
 * Runs cannot be started unless the operator builds the server with `allow_trigger=True`.
 * Explicit `denied_tools` in code still win over any approved permission proposal.
 * The server instructions tell the agent that run logs are data, not instructions.
-* The agent can only withdraw proposals it created itself (`source == "mcp"`).
+* A client can only withdraw proposals it made itself (`source == "mcp"` and its `client_name`).
+* At most 20 proposals from one source wait at a time (`proposals.MAX_PENDING`), so an agent can't flood the queue.
 
 ## Tools
 
@@ -24,9 +25,9 @@
 | `list_approvals(run_id)` | pending human approvals (read-only) |
 | `list_recommendations(dag_id, run_id, status)` | DagEvaluator recommendations and the agent's own proposals |
 | `get_skills(name)` / `get_memory(dag_id)` / `get_stats()` | skills, persisted memory, engine stats |
-| `propose_prompt_change(dag_id, task_id, proposed_prompt, rationale)` | new prompt for an agentic task (applied as an override on approval) |
+| `propose_prompt_change(dag_id, task_id, proposed_prompt, rationale)` | new prompt for an agentic task (applied as an override on approval); refused for a task whose prompt is written in code when it starts |
 | `propose_structural_change(dag_id, description, rationale)` | new tasks / edges in plain language; recorded for a human to implement in code |
-| `propose_tool_permissions(dag_id, rationale, allow, hide, deny)` | DAG-level tool overrides |
+| `propose_tool_permissions(dag_id, rationale, allow, hide, deny, unset)` | DAG-level tool overrides; `unset` drops earlier ones |
 | `propose_skill_rewrite(skill, content, rationale, dag_id)` | new skill version or new skill |
 | `propose_memory_update(dag_id, memory, rationale)` | replace persisted memory |
 | `withdraw_proposal(recommendation_id, reason)` | withdraw one of the agent's own pending proposals |

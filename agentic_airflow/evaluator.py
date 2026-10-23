@@ -269,8 +269,9 @@ def apply_recommendation(engine: "Engine", rec: dict[str, Any]) -> dict[str, Any
     dag_id = rec["dag_id"]
     if kind == "tools":
         overrides = dict(engine.overrides_for(dag_id))
+        unset = set(payload.get("unset") or [])
         for key in ("allow", "hide", "deny"):
-            current = list(overrides.get(key) or [])
+            current = [t for t in overrides.get(key) or [] if t not in unset]
             for name in payload.get(key) or []:
                 if name not in current:
                     current.append(name)
@@ -281,7 +282,9 @@ def apply_recommendation(engine: "Engine", rec: dict[str, Any]) -> dict[str, Any
         engine.set_overrides(dag_id, overrides)
         return {"overrides": overrides}
     if kind == "skills":
-        skill = engine.skills.register(payload["skill"], payload["content"], note=f"DagEvaluator rewrite from run {rec.get('run_id')}")
+        by = "DagEvaluator" if rec.get("source") in (None, "dag_evaluator") else rec.get("proposed_by") or rec.get("source")
+        made = f" from run {rec['run_id']}" if rec.get("run_id") else ""
+        skill = engine.skills.register(payload["skill"], payload["content"], note=f"Approved proposal {rec['id']} by {by}{made}")
         return {"skill": skill.name, "version": skill.current}
     if kind == "topology":
         overrides = dict(engine.overrides_for(dag_id))

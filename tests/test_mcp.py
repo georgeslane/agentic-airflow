@@ -156,3 +156,48 @@ def test_cli_loads_engine_target(tmp_path, monkeypatch):
     assert "d" in load_engine("myapp_engine_mod:make").dags
     with pytest.raises(SystemExit):
         load_engine("myapp_engine_mod")
+
+
+@pytest.mark.asyncio
+async def test_prompts_written_when_a_task_starts(make_engine):
+    with Dag("dyn", prompt="p", auto_evaluate=False) as dag:
+        AgenticTask("written", prompt=lambda engine, run: "Written now.")
+    engine = make_engine()
+    engine.register(dag)
+    server = build_server(engine)
+    got = await call(server, "get_dag", dag_id="dyn")
+    assert got["ok"] and got["data"]["tasks"][0]["effective_prompt"] == "(written when the task starts)"
+    refused = await call(server, "propose_prompt_change", dag_id="dyn", task_id="written", proposed_prompt="x", rationale="r")
+    assert refused["ok"] is False and "writes its prompt when it starts" in refused["error"]
+
+
+@pytest.mark.asyncio
+async def test_clients_withdraw_only_their_own_and_cant_flood_the_queue(engine_with_run):
+    from agentic_airflow.proposals import MAX_PENDING
+
+    engine, _ = engine_with_run
+    mine, other = build_server(engine, client_name="mine"), build_server(engine, client_name="other")
+    made = await call(mine, "propose_structural_change", dag_id="insp", description="Add a step", rationale="r")
+    refused = await call(other, "withdraw_proposal", recommendation_id=made["data"]["id"])
+    assert refused["ok"] is False and "another client" in refused["error"]
+    assert (await call(mine, "withdraw_proposal", recommendation_id=made["data"]["id"]))["ok"]
+    for n in range(MAX_PENDING):
+        assert (await call(mine, "propose_structural_change", dag_id="insp", description=f"Step {n}", rationale="r"))["ok"]
+    flood = await call(other, "propose_structural_change", dag_id="insp", description="One more", rationale="r")
+    assert flood["ok"] is False and "waiting already" in flood["error"]
+
+
+@pytest.mark.asyncio
+async def test_tool_overrides_can_be_taken_back(engine_with_run):
+    engine, _ = engine_with_run
+    server = build_server(engine)
+    allowed = await call(server, "propose_tool_permissions", dag_id="insp", rationale="r", allow=["web_search"], deny=["delete_file"])
+    await engine.approve_recommendation(allowed["data"]["id"])
+    nothing = await call(server, "propose_tool_permissions", dag_id="insp", rationale="r", unset=["send_email"])
+    assert nothing["ok"] is False and "No override" in nothing["error"]
+    back = await call(server, "propose_tool_permissions", dag_id="insp", rationale="r", unset=["web_search"])
+    await engine.approve_recommendation(back["data"]["id"])
+    assert engine.overrides_for("insp")["allow"] == [] and engine.overrides_for("insp")["deny"] == ["delete_file"]
+    skill = await call(server, "propose_skill_rewrite", skill="S", content="New.", rationale="r")
+    await engine.approve_recommendation(skill["data"]["id"])
+    assert engine.skills.get("S").to_dict()["versions"][-1]["note"].startswith(f"Approved proposal {skill['data']['id']} by mcp")
