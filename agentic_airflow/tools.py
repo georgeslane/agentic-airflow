@@ -360,6 +360,10 @@ def resolve_permissions(
 
     Names in the lists may be shell-style patterns (``"news_*"``), matched
     against the registered tools, so they cover tools that come and go.
+
+    With an ``allowed_tools`` list, the tools that ask first and aren't named
+    on it are hidden: found with ``search_tools`` when the task needs one, and
+    still asking, rather than offered in every prompt.
     """
     tools = {t.name: t for t in registry}  # once: a provider's tools are made again each time they're listed
     registered = set(tools)
@@ -386,6 +390,8 @@ def resolve_permissions(
     hidden = (matching(config.hidden_tools) | {n for n, t in tools.items() if t.hidden} | matching(overrides.get("hide") or [])) & (
         allowed | gated
     )
+    if config.allowed_tools is not None:  # a list is what the task needs: others that ask are found when needed
+        hidden |= gated - named
     return ToolPermissions(
         allowed=frozenset(allowed),
         hidden=frozenset(hidden),

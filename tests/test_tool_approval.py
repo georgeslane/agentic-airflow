@@ -51,15 +51,18 @@ def test_tools_that_ask_are_offered_but_gated_unless_named():
     named = _perms(allowed_tools=["read_inbox", "send_email", "push"])
     assert named.allowed == {"read_inbox", "send_email"}  # "always" asks whatever allowed_tools says
     assert named.gated == {"push"} and named.always == {"push"}
+    assert named.hidden == frozenset()
     narrow = _perms(allowed_tools=["send_email"])
     assert narrow.allowed == {"send_email"} and narrow.denied == {"read_inbox"}
+    assert narrow.gated == {"push"} and narrow.hidden == {"push"}  # not named: found when needed, and still asks
+    assert perms.hidden == frozenset()  # without a list, as before
     denied = _perms(denied_tools=["push"])
     assert "push" not in denied.visible and denied.state("push") == "denied"
 
 
 def test_tool_lists_take_patterns():
     perms = _perms(allowed_tools=["read_*", "send_*"], hidden_tools=["send*"])
-    assert perms.allowed == {"read_inbox", "send_email"} and perms.hidden == {"send_email"}
+    assert perms.allowed == {"read_inbox", "send_email"} and perms.hidden == {"send_email", "push"}  # push: unnamed
     assert _perms(denied_tools=["*"]).visible == frozenset()
 
 
