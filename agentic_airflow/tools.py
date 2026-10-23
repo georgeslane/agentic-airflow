@@ -18,6 +18,7 @@ three sets from spec §1:
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import functools
 import inspect
 import json
@@ -334,11 +335,18 @@ def resolve_permissions(
     :class:`~agentic_airflow.evaluator.DagEvaluator` (``{"allow": [...],
     "hide": [...], "deny": [...]}``). Explicit ``denied_tools`` from the
     configuration cascade still win over an ``allow`` override.
+
+    Names in the lists may be shell-style patterns (``"news_*"``), matched
+    against the registered tools, so they cover tools that come and go.
     """
     registered = set(registry.names())
     overrides = overrides or {}
-    named = set(config.allowed_tools or []) | set(overrides.get("allow") or [])
-    denied_explicit = set(config.denied_tools) | set(overrides.get("deny") or [])
+
+    def matching(patterns: Iterable[str]) -> set[str]:
+        return {name for p in patterns for name in fnmatch.filter(registered, p)}
+
+    named = matching([*(config.allowed_tools or []), *(overrides.get("allow") or [])])
+    denied_explicit = matching([*config.denied_tools, *(overrides.get("deny") or [])])
     allowed: set[str] = set()
     gated: set[str] = set()
     always: set[str] = set()
@@ -352,7 +360,7 @@ def resolve_permissions(
         elif config.allowed_tools is None or name in named:
             allowed.add(name)
     denied = registered - allowed - gated
-    hidden = (set(config.hidden_tools) | registry.hidden_by_default() | set(overrides.get("hide") or [])) & (
+    hidden = (matching(config.hidden_tools) | registry.hidden_by_default() | matching(overrides.get("hide") or [])) & (
         allowed | gated
     )
     return ToolPermissions(

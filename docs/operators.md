@@ -79,7 +79,7 @@ Prompt composition: system = DAG objective + task guidelines + skills + tool gui
 
 Resolution per task (`tools.resolve_permissions`):
 
-* `allowed_tools=None` inherits the parent's list; at the top, `None` means every registered tool.
+* `allowed_tools=None` inherits the parent's list; at the top, `None` means every registered tool. Names in any of the lists may be shell-style patterns (`"news_*"`).
 * `denied_tools` accumulate across scopes and always win (also over human-approved `allow` overrides).
 * A tool registered with `approval="ask"` is **gated** (offered to the model, but each call pauses for approval) unless some scope's `allowed_tools` (or an `allow` override) names it; `allowed_tools=None` doesn't count as naming it. One with `approval="always"` is gated whatever `allowed_tools` says, and approving it with `remember=True` doesn't allow it for the rest of the run.
 * `hidden_tools` accumulate; a hidden tool is allowed but its schema is not injected until the agent calls the built-in `search_tools` tool. Tools registered with `hidden=True` are hidden everywhere by default.
@@ -105,7 +105,7 @@ Output contract (enforced JSON schema): `{"rerun": bool, "reason": str}`.
 
 ## `TaskGroup(id, *, model, allowed_tools, denied_tools, hidden_tools, skills, inherit_skills, thinking, max_tool_steps)`
 
-Scoped container and context manager. Nestable. A group built outside a DAG (e.g. the `DagEvaluator`) is attached with `group.attach(dag)`.
+Scoped container and context manager. Nestable. A group built outside a DAG (e.g. the `DagEvaluator`) is attached with `group.attach(dag)`. As in Airflow, a group takes part in `>>` and `<<`: before something it stands for its last tasks (those with nothing after them in the group), after something for its first: `src >> each_email >> report`.
 
 ## `Dag(id, prompt, *, context=None, schedule=None, auto_evaluate=True, description="", tags=(), max_active_runs=1, **TaskGroup options + verbosity)`
 

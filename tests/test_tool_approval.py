@@ -57,6 +57,12 @@ def test_tools_that_ask_are_offered_but_gated_unless_named():
     assert "push" not in denied.visible and denied.state("push") == "denied"
 
 
+def test_tool_lists_take_patterns():
+    perms = _perms(allowed_tools=["read_*", "send_*"], hidden_tools=["send*"])
+    assert perms.allowed == {"read_inbox", "send_email"} and perms.hidden == {"send_email"}
+    assert _perms(denied_tools=["*"]).visible == frozenset()
+
+
 def test_ctx_parameter_is_not_part_of_the_schema():
     @tool
     def where(query: str, ctx) -> str:

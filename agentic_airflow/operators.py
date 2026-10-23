@@ -137,7 +137,7 @@ class BaseOperator:
                 node.upstream.append(self)
 
     def set_upstream(self, other: "BaseOperator | Iterable[BaseOperator]") -> None:
-        for node in _as_nodes(other):
+        for node in _as_nodes(other, last=True):
             node.set_downstream(self)
 
     def __rshift__(self, other):
@@ -204,15 +204,17 @@ class BaseOperator:
         return f"<{type(self).__name__} {self.id}>"
 
 
-def _as_nodes(other: Any) -> list[BaseOperator]:
+def _as_nodes(other: Any, last: bool = False) -> list[BaseOperator]:
+    """The operators ``other`` stands for in a dependency: a task group stands for its first tasks, or with
+    ``last`` its last."""
     if isinstance(other, BaseOperator):
         return [other]
+    if hasattr(other, "roots") and hasattr(other, "leaves") and not getattr(other, "is_dag", False):  # TaskGroup
+        return other._ends(last=last)
     if isinstance(other, (list, tuple, set)):
         nodes = []
         for item in other:
-            if not isinstance(item, BaseOperator):
-                raise DagValidationError(f"Cannot create a dependency on {item!r}")
-            nodes.append(item)
+            nodes.extend(_as_nodes(item, last) if not isinstance(item, BaseOperator) else [item])
         return nodes
     raise DagValidationError(f"Cannot create a dependency on {other!r}")
 

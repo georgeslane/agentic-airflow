@@ -116,3 +116,24 @@ def test_branch_requires_downstream_and_agentic_branch_defaults():
     assert br.is_branch and br.fan_out is False
     assert AgenticTask("l", prompt="x", return_type="list").fan_out is True
     assert AgenticTask("l2", prompt="x", return_type="list", fan_out=False).fan_out is False
+
+
+def test_a_task_group_stands_for_its_first_or_last_tasks():
+    from agentic_airflow import AgenticTask, Dag, Task, TaskGroup
+
+    with Dag("g", prompt="p", auto_evaluate=False) as dag:
+        src = Task("src", fn=lambda: [1], fan_out=True)
+        with TaskGroup("each") as each:
+            a = AgenticTask("a", prompt="a")
+            b = AgenticTask("b", prompt="b")
+            c = AgenticTask("c", prompt="c")
+            a >> [b, c]
+        report = AgenticTask("report", prompt="r")
+        src >> each >> report
+        other = Task("other", fn=lambda: 1)
+        [other, each] >> AgenticTask("after", prompt="x")
+        AgenticTask("before", prompt="y") >> [each]
+    dag.validate()
+    assert a.upstream_ids == ["src", "before"]
+    assert sorted(report.upstream_ids) == ["b", "c"]
+    assert sorted(dag.get("after").upstream_ids) == ["b", "c", "other"]

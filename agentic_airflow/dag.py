@@ -25,7 +25,10 @@ class TaskGroup:
         with TaskGroup("research", skills=["Research"]):
             a = AgenticTask("search", prompt="...")
 
-    Groups can be nested and reused (e.g. the built-in DagEvaluator).
+    Groups can be nested and reused (e.g. the built-in DagEvaluator). As in
+    Airflow, a group can be used with ``>>`` and ``<<``: before something it
+    stands for its last tasks (those with nothing after them in the group),
+    after something for its first.
     """
 
     is_dag = False
@@ -107,6 +110,43 @@ class TaskGroup:
             out.extend(g.all_tasks())
         return out
 
+    # -- dependency syntax: the group's first and last tasks ------------------
+    def roots(self) -> list[BaseOperator]:
+        """Its tasks with nothing before them in the group."""
+        inside = self.all_tasks()
+        return [t for t in inside if not any(u in inside for u in t.upstream)]
+
+    def leaves(self) -> list[BaseOperator]:
+        """Its tasks with nothing after them in the group."""
+        inside = self.all_tasks()
+        return [t for t in inside if not any(d in inside for d in t.downstream)]
+
+    def _ends(self, last: bool) -> list[BaseOperator]:
+        ends = self.leaves() if last else self.roots()
+        if not ends:
+            raise DagValidationError(f"TaskGroup {self.id!r} has no tasks to depend on")
+        return ends
+
+    def __rshift__(self, other: Any) -> Any:
+        for t in self._ends(last=True):
+            t.set_downstream(_first_tasks(other))
+        return other
+
+    def __rrshift__(self, other: Any) -> "TaskGroup":
+        for t in self._ends(last=False):
+            t.set_upstream(_last_tasks(other))
+        return self
+
+    def __lshift__(self, other: Any) -> Any:
+        for t in self._ends(last=False):
+            t.set_upstream(_last_tasks(other))
+        return other
+
+    def __rlshift__(self, other: Any) -> "TaskGroup":
+        for t in self._ends(last=True):
+            t.set_downstream(_first_tasks(other))
+        return self
+
     def scope_chain(self) -> list[ScopeConfig]:
         chain: list[ScopeConfig] = []
         node: TaskGroup | None = self
@@ -132,6 +172,16 @@ class TaskGroup:
             "groups": [g.to_dict() for g in self.groups],
             "config": self.scope.to_dict(),
         }
+
+
+def _first_tasks(other: Any) -> list[BaseOperator]:
+    items = other if isinstance(other, (list, tuple, set)) else [other]
+    return [t for item in items for t in (item.roots() if isinstance(item, TaskGroup) else [item])]
+
+
+def _last_tasks(other: Any) -> list[BaseOperator]:
+    items = other if isinstance(other, (list, tuple, set)) else [other]
+    return [t for item in items for t in (item.leaves() if isinstance(item, TaskGroup) else [item])]
 
 
 class Dag:
