@@ -196,3 +196,23 @@ async def test_tool_list_only_grows_as_tools_are_discovered(make_engine, backend
     first, second = ([t.name for t in r.tools] for r in backend.requests)
     assert first == ["push", "read_inbox", "send_email", "search_tools"]
     assert second == ["push", "read_inbox", "send_email", "news"]  # the new one goes on the end
+
+
+def test_providers_supply_tools_that_change():
+    available = {"a"}
+
+    def provider():
+        return [tool(lambda: n, name=n) for n in sorted(available)]
+
+    registry = ToolRegistry()
+    registry.add_provider(provider)
+
+    @tool(name="a", description="registered")
+    def mine() -> str:
+        return ""
+
+    assert registry.names() == ["a"]
+    available.add("b")
+    assert sorted(registry.names()) == ["a", "b"] and "b" in registry
+    registry.register(mine)
+    assert registry.get("a").description == "registered"  # a registered tool wins

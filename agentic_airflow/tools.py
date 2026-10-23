@@ -230,10 +230,17 @@ def tool(
 
 
 class ToolRegistry:
-    """System-wide collection of tools."""
+    """System-wide collection of tools.
+
+    Tools are registered one by one, or come from providers: functions an
+    application adds with :meth:`add_provider`, called whenever the registry
+    is consulted, for tool sets that change (say, an MCP server's). A
+    registered tool wins over a provider's of the same name.
+    """
 
     def __init__(self, tools: Iterable[Tool | Callable[..., Any]] = ()):
         self._tools: dict[str, Tool] = {}
+        self._providers: list[Callable[[], Iterable[Tool]]] = []
         for t in tools:
             self.register(t)
 
@@ -244,34 +251,49 @@ class ToolRegistry:
         self._tools[t.name] = t
         return t
 
+    def add_provider(self, provider: Callable[[], Iterable[Tool]]) -> None:
+        self._providers.append(provider)
+
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
 
+    def _all(self) -> dict[str, Tool]:
+        if not self._providers:
+            return self._tools
+        found: dict[str, Tool] = {}
+        for provider in self._providers:
+            for t in provider():
+                if t.name != SEARCH_TOOL_NAME:
+                    found.setdefault(t.name, t)
+        return {**found, **self._tools}
+
     def get(self, name: str) -> Tool | None:
-        return self._tools.get(name)
+        return self._all().get(name)
 
     def names(self) -> list[str]:
-        return list(self._tools)
+        return list(self._all())
 
     def __contains__(self, name: object) -> bool:
-        return name in self._tools
+        return name in self._all()
 
     def __len__(self) -> int:
-        return len(self._tools)
+        return len(self._all())
 
     def __iter__(self):
-        return iter(self._tools.values())
+        return iter(self._all().values())
 
     def hidden_by_default(self) -> set[str]:
-        return {t.name for t in self._tools.values() if t.hidden}
+        return {t.name for t in self._all().values() if t.hidden}
 
     def specs(self, names: Iterable[str]) -> list[ToolSpec]:
-        return [self._tools[n].spec() for n in names if n in self._tools]
+        tools = self._all()
+        return [tools[n].spec() for n in names if n in tools]
 
     def search(self, query: str, within: Iterable[str] | None = None, limit: int = 10) -> list[Tool]:
         """Case-insensitive keyword search over names, descriptions and tags."""
+        tools = self._all()
         words = [w for w in re.split(r"\W+", query.lower()) if w]
-        pool = [self._tools[n] for n in (within if within is not None else self._tools) if n in self._tools]
+        pool = [tools[n] for n in (within if within is not None else tools) if n in tools]
         scored: list[tuple[int, Tool]] = []
         for t in pool:
             hay = f"{t.name} {t.description} {' '.join(t.tags)}".lower()

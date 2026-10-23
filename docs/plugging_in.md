@@ -73,6 +73,8 @@ async def send_email(to: str, body: str, ctx) -> str:   # ctx: a ToolContext (ru
 
 `approval="ask"` tools are offered to the model, and each call pauses the task for approval unless the task's `allowed_tools` names the tool; `approval="always"` ones always pause. A function with a `ctx` parameter gets a `ToolContext` saying which run, task and instance called it (`ctx` isn't part of the tool's schema).
 
+For tool sets that change, such as an MCP server's, `registry.add_provider(fn)` adds a function returning `Tool`s, called whenever the registry is consulted (cache them in it if building them is slow).
+
 If your framework already owns tool execution, expose its tools through the registry (thin wrappers) rather than executing them inside `generate`; otherwise the permission model and approvals cannot work.
 
 ## 3. Skills
