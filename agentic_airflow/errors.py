@@ -55,6 +55,11 @@ class RunError(AgenticAirflowError):
     """Problems with a DAG run (unknown id, invalid state transition...)."""
 
 
+class PermanentError(AgenticAirflowError):
+    """Raised by a backend or tool to fail a task without retrying it (``retries``), as when trying again can't
+    help."""
+
+
 class ApprovalError(AgenticAirflowError):
     """An approval / decision could not be applied."""
 

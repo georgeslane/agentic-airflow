@@ -19,8 +19,9 @@ class TaskGroup:
     """Scoped organisational container applying shared configuration.
 
     Accepts ``id``, ``model``, ``allowed_tools``, ``denied_tools``,
-    ``hidden_tools``, ``skills``, ``inherit_skills``, ``thinking`` and
-    ``max_tool_steps``. Use as a context manager::
+    ``hidden_tools``, ``skills``, ``inherit_skills``, ``thinking``,
+    ``max_tool_steps``, ``retries``, ``retry_delay`` and ``ask_user``. Use as a
+    context manager::
 
         with TaskGroup("research", skills=["Research"]):
             a = AgenticTask("search", prompt="...")
@@ -45,6 +46,9 @@ class TaskGroup:
         inherit_skills: bool = True,
         thinking: Thinking | None = None,
         max_tool_steps: int | None = None,
+        retries: int | None = None,
+        retry_delay: float | None = None,
+        ask_user: bool | None = None,
         dag: "Dag | None" = None,
         parent: "TaskGroup | None" = None,
     ):
@@ -60,6 +64,9 @@ class TaskGroup:
             denied_tools=denied_tools,
             hidden_tools=hidden_tools,
             max_tool_steps=max_tool_steps,
+            retries=retries,
+            retry_delay=retry_delay,
+            ask_user=ask_user,
         )
         self.tasks: list[BaseOperator] = []
         self.groups: list[TaskGroup] = []
@@ -197,6 +204,9 @@ class Dag:
       :class:`WebhookTrigger` entries.
     * ``auto_evaluate``: attach the :class:`~agentic_airflow.evaluator.DagEvaluator`
       group to the terminal nodes when the DAG is registered with an engine.
+    * ``catchup``: when the engine starts, run once if a cron firing was
+      missed while it was stopped (with ``trigger["catchup"] = True``). Several
+      missed firings make one run. Needs a persistent state store.
     * all :class:`TaskGroup` parameters (plus ``verbosity``) as DAG defaults.
     """
 
@@ -221,7 +231,11 @@ class Dag:
         thinking: Thinking | None = None,
         verbosity: int | None = None,
         max_tool_steps: int | None = None,
+        retries: int | None = None,
+        retry_delay: float | None = None,
+        ask_user: bool | None = None,
         max_active_runs: int = 1,
+        catchup: bool = False,
         definition: str | None = None,
     ):
         if not DAG_ID_RE.match(id):
@@ -238,6 +252,8 @@ class Dag:
         self.description = description
         self.tags = tuple(tags)
         self.max_active_runs = max_active_runs
+        # On starting, run once if a cron firing was missed while the engine was stopped (Engine._schedule_crons).
+        self.catchup = bool(catchup)
         # The text the application read it from, if it keeps one (a file, say): what a "definition" proposal replaces.
         self.definition = definition
         self.scope = ScopeConfig(
@@ -250,6 +266,9 @@ class Dag:
             denied_tools=denied_tools,
             hidden_tools=hidden_tools,
             max_tool_steps=max_tool_steps,
+            retries=retries,
+            retry_delay=retry_delay,
+            ask_user=ask_user,
         )
         self.tasks: dict[str, BaseOperator] = {}
         self.groups: list[TaskGroup] = []
@@ -427,6 +446,7 @@ class Dag:
             "tags": list(self.tags),
             "schedule": [t.to_dict() for t in self.schedule],
             "auto_evaluate": self.auto_evaluate,
+            "catchup": self.catchup,
             "config": self.scope.to_dict(),
             "definition": self.definition,
             "tasks": [t.describe() for t in self.topological_order()],

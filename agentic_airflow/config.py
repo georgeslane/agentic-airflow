@@ -2,8 +2,9 @@
 
 Resolution rules (see spec §1):
 
-* **Standard parameters** (``model``, ``thinking``, ``verbosity``,
-  ``max_tool_steps``): the most specific non-``None`` value wins.
+* **Standard parameters** (``model``, ``thinking``, ``verbosity``, ``retries``,
+  ``retry_delay``, ``ask_user``, ``max_tool_steps``): the most specific
+  non-``None`` value wins.
 * **Skills**: additive (union, order preserved) unless a scope sets
   ``inherit_skills=False``, in which case the cascade restarts at that scope.
 * **Tool permissions**: ``allowed_tools=None`` inherits the parent's list;
@@ -33,6 +34,9 @@ class ScopeConfig:
     denied_tools: list[str] | None = None
     hidden_tools: list[str] | None = None
     max_tool_steps: int | None = None
+    retries: int | None = None
+    retry_delay: float | None = None
+    ask_user: bool | None = None
 
     def __post_init__(self) -> None:
         if self.thinking not in (None, "on", "off"):
@@ -41,6 +45,12 @@ class ScopeConfig:
             raise ValueError("verbosity must be 0, 1 or 2")
         if self.max_tool_steps is not None and self.max_tool_steps < 0:
             raise ValueError("max_tool_steps must be >= 0")
+        if self.retries is not None and (isinstance(self.retries, bool) or not isinstance(self.retries, int) or self.retries < 0):
+            raise ValueError("retries must be an integer >= 0")
+        if self.retry_delay is not None and (isinstance(self.retry_delay, bool) or not isinstance(self.retry_delay, (int, float)) or self.retry_delay < 0):
+            raise ValueError("retry_delay must be a number of seconds >= 0")
+        if self.ask_user is not None and not isinstance(self.ask_user, bool):
+            raise ValueError("ask_user must be True, False or None")
         for name in ("skills", "allowed_tools", "denied_tools", "hidden_tools"):
             value = getattr(self, name)
             if value is not None:
@@ -50,6 +60,9 @@ class ScopeConfig:
 
     def to_dict(self) -> dict:
         return {f.name: getattr(self, f.name) for f in fields(self)}
+
+
+DEFAULT_RETRY_DELAY = 60.0  # seconds
 
 
 @dataclass(frozen=True)
@@ -65,6 +78,12 @@ class ResolvedConfig:
     denied_tools: frozenset[str]
     hidden_tools: frozenset[str]
     max_tool_steps: int
+    retries: int = 0
+    """How many times a failed task is run again."""
+    retry_delay: float = DEFAULT_RETRY_DELAY
+    """Seconds between a failure and the next attempt."""
+    ask_user: bool = False
+    """Whether an agentic task is offered the ``ask_user`` tool."""
 
     def to_dict(self) -> dict:
         return {
@@ -76,6 +95,9 @@ class ResolvedConfig:
             "denied_tools": sorted(self.denied_tools),
             "hidden_tools": sorted(self.hidden_tools),
             "max_tool_steps": self.max_tool_steps,
+            "retries": self.retries,
+            "retry_delay": self.retry_delay,
+            "ask_user": self.ask_user,
         }
 
 
@@ -92,6 +114,9 @@ def resolve_config(scopes: Sequence[ScopeConfig]) -> ResolvedConfig:
     thinking: Thinking | None = None
     verbosity: int | None = None
     max_tool_steps: int | None = None
+    retries: int | None = None
+    retry_delay: float | None = None
+    ask_user: bool | None = None
     skills: list[str] = []
     allowed: list[str] | None = None
     denied: list[str] = []
@@ -106,6 +131,12 @@ def resolve_config(scopes: Sequence[ScopeConfig]) -> ResolvedConfig:
             verbosity = scope.verbosity
         if scope.max_tool_steps is not None:
             max_tool_steps = scope.max_tool_steps
+        if scope.retries is not None:
+            retries = scope.retries
+        if scope.retry_delay is not None:
+            retry_delay = scope.retry_delay
+        if scope.ask_user is not None:
+            ask_user = scope.ask_user
         if not scope.inherit_skills:
             skills = list(scope.skills or [])
         elif scope.skills:
@@ -126,6 +157,9 @@ def resolve_config(scopes: Sequence[ScopeConfig]) -> ResolvedConfig:
         denied_tools=frozenset(denied),
         hidden_tools=frozenset(hidden),
         max_tool_steps=max_tool_steps if max_tool_steps is not None else DEFAULT_MAX_TOOL_STEPS,
+        retries=retries or 0,
+        retry_delay=float(retry_delay) if retry_delay is not None else DEFAULT_RETRY_DELAY,
+        ask_user=bool(ask_user),
     )
 
 

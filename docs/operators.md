@@ -19,6 +19,11 @@ summary << archive                               # reverse works too
 | `on_complete` | callable `(engine, run, instance)` | `None` | Hook after success (sync or async), awaited before the instance counts as done. |
 | `outlets` | list of `Asset` or asset names | `[]` | Assets the node updates once all its instances have finished, if it produced something: DAGs with `Asset(name)` in their `schedule` run with what it produced (see [Assets](#assets-outlets)). Not allowed on branches. |
 | `skip_if` | callable `(engine, run) -> str \| None` | `None` | Checked when the node is about to be scheduled: a returned reason skips it (and, by the trigger rules, what depends only on it). |
+| `retries` / `retry_delay` | `int` / seconds | inherit (`0` / `60`) | How many times the node is run again after it fails, and the wait between. See [Retries](#retries). |
+
+### Retries
+
+A node that fails (raises, times out, exceeds `max_tool_steps`, or answers malformed past `output_retries`) is run again from the start after `retry_delay` seconds, up to `retries` times, with `attempt` counting up. Set them on the node, its group, the DAG or `EngineConfig`. Each failed attempt is in the run log, and in the instance's `retry_history` as `{"attempt", "reason", "failed": True, "tool_calls"}`: an agentic retry is told what went wrong and which tools it had already called, since what they did may have happened, so it doesn't do it twice. A failure raised as `PermanentError` (say, by a backend that has already tried again itself) isn't retried. While it waits, the instance is `QUEUED` and doesn't hold its model; cancelling the run stops it, and stopping the engine leaves it to go again on `resume()`.
 
 ### Data flow rules
 
@@ -40,7 +45,7 @@ summary << archive                               # reverse works too
 
 If a `Task`/`Branch` function declares a `ctx` parameter (or `**kwargs`) it receives a `TaskContext` with `run_id`, `dag_id`, `task_id`, `instance_id`, `map_path`, `attempt`, `memory`, `seed`, `trigger` (`{"source", "payload", ...}`), `upstream`, `retry_history`, `run_log` (the `dag_context`) and `engine`.
 
-## `Task(id, fn, *, context=None, fan_out=False, follow_mapping=False, trigger_rule=..., on_complete=None)`
+## `Task(id, fn, *, context=None, fan_out=False, follow_mapping=False, trigger_rule=..., on_complete=None, retries=None, retry_delay=None)`
 
 Deterministic Python wrapper. `fn` may be sync (runs on the CPU worker pool, never blocking the event loop) or async.
 
@@ -72,6 +77,7 @@ Unselected downstream nodes and their *exclusive* descendants are `SKIPPED`. Joi
 | `system_prompt` | `None` | Extra task-level guidelines appended to the DAG objective. |
 | `prompt` | required | A string, or (from application code) `fn(engine, run) -> str`, written when the task starts. |
 | `validator` | `None` | `fn(value)`: checks the answer once it matches `return_type`; raising `OutputValidationError` sends its message back to the model (within `output_retries`); returning a value replaces the answer. |
+| `ask_user` | inherit (`False`) | Offer the task the `ask_user` tool. See [Asking a human](#asking-a-human). |
 
 Prompt composition: system = DAG objective + task guidelines + skills + tool guidance + output contract + data notice. User message = memory + trigger payload (unmapped instances only) + upstream outputs (delimited `<<<BEGIN id>>> … <<<END id>>>` blocks) + retry history + workflow definition + run log + branch choices, then **the task prompt last**: models follow instructions after long context best, and tasks given the same data share a prefix a model server can cache. Outputs longer than `EngineConfig.max_context_chars` are truncated with a marker; the run log gives each entry an equal share of it, one line each.
 
@@ -86,6 +92,10 @@ Resolution per task (`tools.resolve_permissions`):
 * Anything registered but not allowed is **denied**: calling it serialises the conversation, puts the instance in `AWAITING_TOOL_APPROVAL`, releases the model slot and creates an `Approval`. `engine.approve(id, remember=True)` executes it (and allows it for the rest of the run); `engine.reject(id, reason)` injects a denial message so the agent adjusts.
 * Unknown (unregistered) tool names produce an error message to the model, not a pause.
 * Tool arguments are validated against the tool's JSON schema before execution.
+
+### Asking a human
+
+With `ask_user=True` (on the task, its group, the DAG or `EngineConfig`) an agentic task is offered the built-in tool `ask_user(question, choices=[...])`, for a decision that's the human's to make. Calling it checkpoints the conversation, puts the instance in `AWAITING_USER`, releases the model slot and creates an `Approval` of kind `"question"` (`payload = {"question", "choices", "tool_call"}`), with a `task.awaiting_user` event. `engine.answer(id, "Yes, but…")` gives the task the answer as the tool's result, and it carries on; `engine.decide(id, "dismiss", reason=...)`, or `approval_timeout`, tells it there was no answer, to decide for itself. A task without `ask_user` that calls the tool is told it isn't available.
 
 ## `AgenticBranch(id, prompt, *, multi_select=False, allow_none=False, **AgenticTask options)`
 
@@ -103,17 +113,18 @@ Output contract (enforced JSON schema): `{"rerun": bool, "reason": str}`.
 * After `max_retries` reruns: `pass_latest` passes the last output, `fail_dag` fails the task (and the run), `pause_for_user` creates an `evaluator_exhausted` approval. Resolve it with `engine.decide(id, "pass" | "retry" | "fail")`.
 * With a mapped target the evaluator is mapped 1:1 (`follow_mapping=True`), so each lane has its own loop.
 
-## `TaskGroup(id, *, model, allowed_tools, denied_tools, hidden_tools, skills, inherit_skills, thinking, max_tool_steps)`
+## `TaskGroup(id, *, model, allowed_tools, denied_tools, hidden_tools, skills, inherit_skills, thinking, max_tool_steps, retries, retry_delay, ask_user)`
 
 Scoped container and context manager. Nestable. A group built outside a DAG (e.g. the `DagEvaluator`) is attached with `group.attach(dag)`. As in Airflow, a group takes part in `>>` and `<<`: before something it stands for its last tasks (those with nothing after them in the group), after something for its first: `src >> each_email >> report`.
 
-## `Dag(id, prompt, *, context=None, schedule=None, auto_evaluate=True, description="", tags=(), max_active_runs=1, **TaskGroup options + verbosity)`
+## `Dag(id, prompt, *, context=None, schedule=None, auto_evaluate=True, description="", tags=(), max_active_runs=1, catchup=False, definition=None, **TaskGroup options + verbosity)`
 
 * `prompt` is the global objective rendered into every agentic system prompt and audited by the DagEvaluator.
 * `context` (dict or str) is static seed context merged with the persisted memory (`{**seed, **memory}`; a string seed is stored under `"seed"`).
 * `schedule` accepts cron strings, `CronTrigger(expr, timezone)`, `DagTrigger(dag_id, on=("success",))`, `WebhookTrigger(name, secret=None, max_bytes=1_000_000)`.
 * `auto_evaluate=True` attaches the DagEvaluator at `engine.register()` time (skipped with a warning if the engine has no backend). Pass `engine.register(dag, evaluator=DagEvaluator(model="judge"))` to customise it.
 * `max_active_runs` queues additional runs of the same DAG.
+* `catchup=True`: when the engine starts, if a cron firing came due while it was stopped, the DAG runs once at once, for the latest it missed (`trigger = {"source": "cron", "catchup": True, "scheduled_for", ...}`), however many were missed. When each cron trigger last came due is kept in the state store (meta `cron_due`), so it needs a persistent store; firings due while the DAG was paused aren't caught up, and a DAG seen for the first time starts from then.
 
 ### Assets (outlets)
 
@@ -132,4 +143,4 @@ Once all of a node's instances have finished, each of its `outlets` is updated w
 
 ## Configuration cascade (`config.py`)
 
-`EngineConfig` (system scope) → `Dag` → `TaskGroup` chain → task. `EngineConfig` adds engine knobs: `model_concurrency: {model: n}`, `default_concurrency=1`, `cpu_workers=4`, `max_context_chars=60_000`, `output_retries=1`, `persist_every_step=True`, `atomic="task"` (or `"step"`), `max_active_runs_per_model=1`, `approval_timeout=None`, `task_timeout=None`, `max_mapped=100`, `keep_runs=None` (see `config.EngineConfig`). Inspect the result for any task with `engine.resolved_config(dag_id, task_id)`.
+`EngineConfig` (system scope) → `Dag` → `TaskGroup` chain → task. `EngineConfig` adds engine knobs: `model_concurrency: {model: n}`, `default_concurrency=1`, `cpu_workers=4`, `max_context_chars=60_000`, `output_retries=1`, `persist_every_step=True`, `atomic="task"` (or `"step"`), `retries=None` (0), `retry_delay=None` (60), `ask_user=None` (off), `max_active_runs_per_model=1`, `approval_timeout=None`, `task_timeout=None`, `max_mapped=100`, `keep_runs=None` (see `config.EngineConfig`). Inspect the result for any task with `engine.resolved_config(dag_id, task_id)`.

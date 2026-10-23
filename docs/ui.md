@@ -53,7 +53,7 @@ The server runs in a daemon thread and proxies calls onto the engine's event loo
 | `GET /api/runs?dag_id=&limit=`, `GET /api/runs/{id}`, `/graph`, `/log` | run state, graph, `dag_context` |
 | `POST /api/runs` `{"dag_id", "payload"}` | trigger a run (202) |
 | `POST /api/runs/{id}/cancel` | cancel |
-| `GET /api/approvals?status=pending|all`, `POST /api/approvals/{id}` `{"decision": "approve"|"reject"|"pass"|"retry"|"fail", "remember", "reason"}` | human in the loop |
+| `GET /api/approvals?status=pending|all`, `POST /api/approvals/{id}` `{"decision": "approve"|"reject"|"answer"|"dismiss"|"pass"|"retry"|"fail", "remember", "reason", "answer"}` | human in the loop |
 | `GET /api/recommendations`, `POST /api/recommendations/{id}` `{"decision": "approve"|"reject"}` | DagEvaluator gate |
 | `POST /api/chat` `{"question", "run_id"}` | live user chat |
 | `POST /webhooks/{name}` (`X-Signature-256: sha256=<hmac>`) | webhook delivery (202) |

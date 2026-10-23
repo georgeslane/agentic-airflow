@@ -23,6 +23,7 @@ from .errors import (
     ConfigurationError,
     DagValidationError,
     OutputValidationError,
+    PermanentError,
     RunError,
     SchemaValidationError,
     StaleProposalError,
@@ -56,7 +57,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "AgenticAirflowError", "ApprovalError", "ConfigurationError", "DagValidationError", "OutputValidationError",
-    "RunError", "SchemaValidationError", "StaleProposalError", "ToolError", "ToolPermissionError", "TriggerError", "WebhookAuthenticationError",
+    "PermanentError", "RunError", "SchemaValidationError", "StaleProposalError", "ToolError", "ToolPermissionError", "TriggerError", "WebhookAuthenticationError",
     "Dag", "TaskGroup", "Task", "Branch", "AgenticTask", "AgenticBranch", "AgenticEvaluator", "NO_BRANCH",
     "DagEvaluator", "attach_dag_evaluator", "trigger_items", "found_nothing", "Applier",
     "Engine", "EngineConfig", "ScopeConfig", "ResolvedConfig", "resolve_config",

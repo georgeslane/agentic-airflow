@@ -18,7 +18,7 @@ moved into a ``SameSite=Strict`` cookie and taken out of the address):
 * ``GET  /api/runs/{run_id}/graph``       - graph JSON with live status
 * ``POST /api/runs``  ``{"dag_id": ..., "payload": ...}``  - trigger
 * ``POST /api/runs/{run_id}/cancel``
-* ``GET  /api/approvals`` / ``POST /api/approvals/{id}`` ``{"decision": "approve"|"reject"|..., "remember": bool, "reason": str}``
+* ``GET  /api/approvals`` / ``POST /api/approvals/{id}`` ``{"decision": "approve"|"reject"|"answer"|..., "remember": bool, "reason": str, "answer": str}``
 * ``GET  /api/recommendations`` / ``POST /api/recommendations/{id}`` ``{"decision": "approve"|"reject"}``
 * ``POST /api/chat`` ``{"question": ..., "run_id": ...}``
 * ``POST /webhooks/{name}``               - webhook delivery (HMAC via ``X-Signature-256``)
@@ -315,7 +315,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"run_id": run.run_id, "status": run.status.value})
         if len(segs) == 3 and segs[:2] == ["api", "approvals"]:
             decision = str(data.get("decision") or "")
-            extra = {k: v for k, v in data.items() if k in ("remember", "reason", "note")}
+            extra = {k: v for k, v in data.items() if k in ("remember", "reason", "note", "answer")}
             approval = srv.call(engine.decide, segs[2], decision, **extra)
             return self._json(approval.to_dict())
         if len(segs) == 3 and segs[:2] == ["api", "recommendations"]:

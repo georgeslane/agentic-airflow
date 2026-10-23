@@ -36,7 +36,7 @@ from .agent_loop import _dump, run_agentic_instance
 from .config import EngineConfig, ResolvedConfig, resolve_config
 from .dag import Dag
 from .helpers import is_empty
-from .errors import ApprovalError, ConfigurationError, RunError, StaleProposalError, TriggerError
+from .errors import ApprovalError, ConfigurationError, PermanentError, RunError, StaleProposalError, TriggerError
 from .models import GenerationRequest, Message, ModelBackend, OutputSpec
 from .operators import NO_BRANCH, AgenticBranch, AgenticEvaluator, BaseOperator, Task
 from .priority import USER_PRIORITY, ModelQueueSet
@@ -63,6 +63,7 @@ log = logging.getLogger("agentic_airflow")
 
 EventCallback = Callable[[Event], Any]
 PAUSED_KEY = "paused_dags"  # meta document: {"dag_ids": [...]}
+CRON_KEY = "cron_due"  # meta document: {dag_id: {cron expression: when it last came due, ISO}}, for catchup
 
 
 class Engine:
@@ -108,6 +109,8 @@ class Engine:
         self._cron_task: asyncio.Task | None = None
         self._tick = asyncio.Event()  # wakes the scheduler loop: a DAG was registered or an approval created
         self._cron_next: dict[tuple[str, int], datetime] = {}
+        self._cron_due: dict[str, dict[str, str]] = dict(self.state.get_meta(CRON_KEY) or {})
+        self._catching_up: set[tuple[str, int]] = set()  # cron firings missed while stopped, due now
         self._started = False
         self.loop: asyncio.AbstractEventLoop | None = None
         for approval in self.state.list_approvals(status="pending"):
@@ -156,6 +159,8 @@ class Engine:
         self.dags.pop(dag_id, None)
         for key in [k for k in self._cron_next if k[0] == dag_id]:
             self._cron_next.pop(key, None)
+        if self._cron_due.pop(dag_id, None) is not None:
+            self.state.set_meta(CRON_KEY, self._cron_due)
         for run in list(self.runs.values()):
             if run.dag_id == dag_id and run.status == RunStatus.PENDING and run.run_id not in self._drivers:
                 run.error = "Its DAG was unregistered before it started."
@@ -399,10 +404,28 @@ class Engine:
     # Triggers: cron / dag / webhook
     # ------------------------------------------------------------------
     def _schedule_crons(self, dag: Dag) -> None:
+        """When each of a DAG's cron triggers fires next: for a DAG with ``catchup``, now, if one came due while the
+        engine was stopped (once, for the latest it missed)."""
         now = datetime.now(timezone.utc)
+        due = self._cron_due.setdefault(dag.id, {})
         for idx, trig in enumerate(dag.schedule):
-            if isinstance(trig, CronTrigger):
-                self._cron_next[(dag.id, idx)] = trig.next_fire(now)
+            if not isinstance(trig, CronTrigger):
+                continue
+            key = (dag.id, idx)
+            last = due.get(trig.expression)
+            missed = _latest_missed(trig, datetime.fromisoformat(last), now) if dag.catchup and last else None
+            if missed is not None:
+                self._cron_next[key] = missed
+                self._catching_up.add(key)
+            else:
+                self._cron_next[key] = trig.next_fire(now)
+            if last is None:  # from now: a firing missed after this is caught up
+                due[trig.expression] = now.isoformat()
+        self.state.set_meta(CRON_KEY, self._cron_due)
+
+    def _came_due(self, dag_id: str, expression: str, when: datetime) -> None:
+        self._cron_due.setdefault(dag_id, {})[expression] = when.isoformat()
+        self.state.set_meta(CRON_KEY, self._cron_due)
 
     def next_cron_fires(self) -> dict[str, list[str]]:
         out: dict[str, list[str]] = {}
@@ -424,12 +447,17 @@ class Engine:
                         trig = dag.schedule[idx]
                         assert isinstance(trig, CronTrigger)
                         self._cron_next[key] = trig.next_fire(now)
+                        self._came_due(dag_id, trig.expression, when)  # paused or not: catchup is for when stopped
+                        extra = {"cron": trig.expression, "scheduled_for": when.isoformat()}
+                        if key in self._catching_up:
+                            self._catching_up.discard(key)
+                            extra["catchup"] = True
                         if self.is_paused(dag_id):
                             continue
                         if any(r.dag_id == dag_id and r.status == RunStatus.PENDING for r in self.runs.values()):
                             log.info("DAG %s is still waiting to start a run: not queueing another for %s", dag_id, when)
                             continue
-                        await self.trigger(dag_id, None, source="cron", extra={"cron": trig.expression, "scheduled_for": when.isoformat()})
+                        await self.trigger(dag_id, None, source="cron", extra=extra)
                 await self._expire_approvals()
                 upcoming = [(w - datetime.now(timezone.utc)).total_seconds() for w in self._cron_next.values()]
                 if self.config.approval_timeout is not None:
@@ -454,7 +482,7 @@ class Engine:
         for approval in list(self._approvals.values()):
             if approval.status != "pending" or time.time() - approval.created_at < timeout:
                 continue
-            decision = "reject" if approval.kind == "tool_call" else "fail"
+            decision = {"tool_call": "reject", "question": "dismiss"}.get(approval.kind, "fail")
             try:
                 await self.decide(approval.approval_id, decision, reason=f"No answer within {timeout:g} seconds.")
             except Exception:  # noqa: BLE001
@@ -951,6 +979,24 @@ class Engine:
     async def _run_instance(self, run: DagRun, inst: TaskInstance, op: BaseOperator) -> None:
         dag = self.dag_for(run)
         cfg = resolve_config([self.config, *dag.scopes_for(op)])
+        try:
+            while not await self._attempt(run, inst, op, cfg):  # it failed, and is tried again after retry_delay
+                try:
+                    await asyncio.sleep(cfg.retry_delay)
+                except asyncio.CancelledError:
+                    if run.run_id not in self._detaching:  # stopping Athena leaves it to retry on resume
+                        inst.status = TaskStatus.FAILED
+                        inst.error = "cancelled"
+                        inst.finished_at = time.time()
+                    raise
+        finally:
+            self._instance_tasks.get(run.run_id, {}).pop(inst.instance_id, None)
+            self._persist(run)
+            self._wake(run.run_id)
+
+    async def _attempt(self, run: DagRun, inst: TaskInstance, op: BaseOperator, cfg: ResolvedConfig) -> bool:
+        """Run an instance once: False if it failed and should be tried again, True otherwise (it finished, failed
+        for good, or paused for a human)."""
         inst.status = TaskStatus.RUNNING
         inst.started_at = inst.started_at or time.time()
         self._chat_event(cfg, 1, Event("task.started", run.run_id, run.dag_id, op.id, inst.instance_id, {"attempt": inst.attempt}))
@@ -961,8 +1007,12 @@ class Engine:
                 perms = resolve_permissions(cfg, self.tools, self.overrides_for(run.dag_id))
                 outcome = await run_agentic_instance(self, run, inst, op, cfg, perms, input_context)  # type: ignore[arg-type]
                 if outcome.status == "awaiting_tool_approval":
-                    self._pause_for_tool(run, inst, op, cfg, outcome.payload or {})
-                    return
+                    payload = outcome.payload or {}
+                    if payload.get("reason") == "question":
+                        self._pause_for_user(run, inst, op, cfg, payload)
+                    else:
+                        self._pause_for_tool(run, inst, op, cfg, payload)
+                    return True
                 value = outcome.value
             else:
                 value = await self._run_python(run, inst, op, input_context)  # type: ignore[arg-type]
@@ -972,9 +1022,10 @@ class Engine:
             if op.is_evaluator:
                 state = self._after_evaluator(run, inst, op, value, cfg)  # type: ignore[arg-type]
                 if state in ("rerun", "paused"):
-                    return
+                    return True
                 value = inst.output
             await self._complete(run, inst, op, cfg, value)
+            return True
         except asyncio.CancelledError:
             if run.run_id not in self._detaching:
                 inst.status = TaskStatus.FAILED
@@ -987,11 +1038,25 @@ class Engine:
             inst.finished_at = time.time()
             self._log(run, inst)
             log.warning("task %s/%s failed: %s", run.dag_id, inst.instance_id, inst.error, exc_info=log.isEnabledFor(logging.DEBUG))
+            again = inst.attempt <= cfg.retries and not isinstance(exc, PermanentError) and not self._cancel_requested_for(run)
+            if again:
+                self._retry(run, inst, op, cfg)
+                return False
             self._chat_event(cfg, 1, Event("task.failed", run.run_id, run.dag_id, op.id, inst.instance_id, {"error": inst.error}))
-        finally:
-            self._instance_tasks.get(run.run_id, {}).pop(inst.instance_id, None)
-            self._persist(run)
-            self._wake(run.run_id)
+            return True
+
+    def _retry(self, run: DagRun, inst: TaskInstance, op: BaseOperator, cfg: ResolvedConfig) -> None:
+        """A failed instance is tried again after ``retry_delay``: from the start, told what went wrong and which
+        tools it had called, whose effects may have happened."""
+        error = inst.error
+        called = [str(c.get("name")) for c in inst.tool_calls if c.get("status") in ("ok", "approved")]
+        inst.retry_history.append({"attempt": inst.attempt, "output": None, "reason": error, "failed": True, "tool_calls": list(dict.fromkeys(called))})
+        inst.attempt += 1
+        inst.reset_for_retry()
+        inst.status = TaskStatus.QUEUED  # still the driver's, waiting to go again
+        inst.reason = f"failed ({error}): trying again in {cfg.retry_delay:g}s, attempt {inst.attempt} of {cfg.retries + 1}"
+        self._persist(run)
+        self._chat_event(cfg, 1, Event("task.retrying", run.run_id, run.dag_id, op.id, inst.instance_id, {"error": error, "attempt": inst.attempt, "delay": cfg.retry_delay}))
 
     async def _complete(self, run: DagRun, inst: TaskInstance, op: BaseOperator, cfg: ResolvedConfig, value: Any) -> None:
         inst.output = value
@@ -1129,6 +1194,12 @@ class Engine:
         inst.reason = f"tool {payload.get('tool_call', {}).get('name')!r} requires approval ({approval.approval_id})"
         self._chat_event(cfg, 1, Event("task.awaiting_tool_approval", run.run_id, run.dag_id, op.id, inst.instance_id, {"approval_id": approval.approval_id, "tool_call": payload.get("tool_call")}))
 
+    def _pause_for_user(self, run: DagRun, inst: TaskInstance, op: BaseOperator, cfg: ResolvedConfig, payload: dict[str, Any]) -> None:
+        approval = self._create_approval(run, inst, op, "question", payload)
+        inst.status = TaskStatus.AWAITING_USER
+        inst.reason = f"waiting for an answer to {payload.get('question')!r} ({approval.approval_id})"
+        self._chat_event(cfg, 1, Event("task.awaiting_user", run.run_id, run.dag_id, op.id, inst.instance_id, {"approval_id": approval.approval_id, "question": payload.get("question"), "choices": payload.get("choices")}))
+
     def list_approvals(self, status: str | None = "pending", run_id: str | None = None) -> list[Approval]:
         items = [a for a in self._approvals.values() if (status is None or a.status == status) and (run_id is None or a.run_id == run_id)]
         if status not in (None, "pending"):
@@ -1152,10 +1223,16 @@ class Engine:
         """Reject a pending tool call; the agent is told and continues without it."""
         return await self.decide(approval_id, "reject", reason=reason)
 
+    async def answer(self, approval_id: str, answer: str) -> Approval:
+        """Answer a task's question (``ask_user``): the task carries on with the answer."""
+        return await self.decide(approval_id, "answer", answer=answer)
+
     async def decide(self, approval_id: str, decision: str, **extra: Any) -> Approval:
         """Resolve any approval.
 
         * ``kind="tool_call"``: ``decision`` is ``"approve"`` or ``"reject"``.
+        * ``kind="question"``: ``"answer"`` (with ``answer=``) or ``"dismiss"``
+          (with an optional ``reason``): the task decides for itself.
         * ``kind="evaluator_exhausted"``: ``"pass"`` (accept latest output),
           ``"retry"`` (grant one more rerun cycle) or ``"fail"``.
         """
@@ -1188,6 +1265,21 @@ class Engine:
             inst.reason = None
             inst.approval_id = None
             approval.status = "approved" if decision == "approve" else "rejected"
+        elif approval.kind == "question":
+            if decision not in ("answer", "dismiss"):
+                raise ApprovalError("question approvals take decision 'answer' or 'dismiss'")
+            answer = str(extra.get("answer") or "").strip()
+            if decision == "answer" and not answer:
+                raise ApprovalError("An answer is needed: dismiss the question to leave it unanswered")
+            ck = inst.checkpoint or {}
+            if not ck.get("pending"):
+                raise ApprovalError("Instance has no pending question to resolve")
+            ck["pending"]["decision"] = {"answer": answer if decision == "answer" else None, "reason": str(extra.get("reason") or "")}
+            inst.checkpoint = ck
+            inst.status = TaskStatus.PENDING
+            inst.reason = None
+            inst.approval_id = None
+            approval.status = "answered" if decision == "answer" else "dismissed"
         elif approval.kind == "evaluator_exhausted":
             if decision not in ("pass", "retry", "fail"):
                 raise ApprovalError("evaluator approvals take decision 'pass', 'retry' or 'fail'")
@@ -1375,6 +1467,18 @@ class Engine:
             "pending_approvals": len([a for a in self._approvals.values() if a.status == "pending"]),
             "next_cron_fires": self.next_cron_fires(),
         }
+
+
+def _latest_missed(trig: CronTrigger, last: datetime, now: datetime, most: int = 1000) -> datetime | None:
+    """The latest time ``trig`` came due after ``last`` and by ``now``: None if it hasn't. Past ``most`` firings
+    (an every-minute cron, stopped for a day), ``now`` will do."""
+    missed = None
+    when = trig.next_fire(last)
+    for _ in range(most):
+        if when > now:
+            return missed
+        missed, when = when, trig.next_fire(when)
+    return now
 
 
 def node_output(node: BaseOperator, insts: list[TaskInstance]) -> Any:
