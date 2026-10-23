@@ -80,4 +80,33 @@ The same list is served by `GET /api/recommendations` and decided through `POST 
 
 ## Using the proposal API without MCP
 
-`agentic_airflow.proposals` is part of the core package and has no dependencies, so an application (or a tool exposed to agents *inside* a DAG) can create the same gated proposals directly: `propose_prompt_change(engine, ...)`, `propose_tool_permissions(engine, ...)`, `propose_skill_rewrite(engine, ...)`, `propose_memory_update(engine, ...)`, `propose_structural_change(engine, ...)`, `withdraw_proposal(engine, rec_id)`.
+`agentic_airflow.proposals` is part of the core package and has no dependencies, so an application (or a tool exposed to agents *inside* a DAG) can create the same gated proposals directly: `propose_prompt_change(engine, ...)`, `propose_tool_permissions(engine, ...)`, `propose_skill_rewrite(engine, ...)`, `propose_memory_update(engine, ...)`, `propose_structural_change(engine, ...)`, `propose_definition(engine, ...)`, `withdraw_proposal(engine, rec_id)`.
+
+## Proposals your application applies
+
+By default an approved prompt or tool change is applied as an *override*, kept in the state store beside the DAG. That suits DAGs defined in code. An application that reads its DAGs from text (files a user edits, say) wants the text to stay what runs, so it decides which kinds of proposal it takes, and how each is applied, with `engine.appliers`:
+
+```python
+from agentic_airflow import Applier, Dag, StaleProposalError
+from agentic_airflow.errors import ConfigurationError
+
+dag = read_my_dag(text)            # however the application builds it
+dag.definition = text              # or Dag(..., definition=text): what a "definition" proposal replaces
+
+def check(engine, rec):            # when it's proposed: ConfigurationError tells the proposer why it won't do
+    read_my_dag(rec["payload"]["definition"])
+
+async def apply(engine, rec):      # when a human approves it
+    if rec["payload"]["base"] != current_text(rec["dag_id"]):
+        raise StaleProposalError("The DAG has changed since")   # marked stale, and raised
+    save_and_register(rec["payload"]["definition"])
+    return {"saved": True}         # kept as the proposal's "applied"
+
+engine.appliers["definition"] = Applier(apply, check)
+for kind in ("topology", "tools", "memory"):   # no overrides: they'd make the file and what runs differ
+    del engine.appliers[kind]
+```
+
+- **`propose_definition(engine, dag_id, definition, rationale, title=..., run_id=..., details=...)`** proposes a whole new text; the payload keeps the text it replaces as `base`, with `details` besides.
+- **Only kinds in `engine.appliers` can be proposed or approved**, and the MCP server only offers tools for those, as the engine is when the server's built: here `propose_definition` and `propose_skill_rewrite`, and `get_dag` returns the `definition`.
+- **A stale proposal**, one whose applier raised `StaleProposalError`, gets status `stale`, with the reason.

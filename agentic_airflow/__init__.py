@@ -25,6 +25,7 @@ from .errors import (
     OutputValidationError,
     RunError,
     SchemaValidationError,
+    StaleProposalError,
     ToolError,
     ToolPermissionError,
     TriggerError,
@@ -44,6 +45,7 @@ from .models import (
     ToolSpec,
 )
 from .operators import NO_BRANCH, AgenticBranch, AgenticEvaluator, AgenticTask, Branch, Task
+from .proposals import Applier
 from .run import Approval, DagRun, Event, RunStatus, TaskContext, TaskInstance, TaskStatus
 from .skills import SkillStore
 from .state import InMemoryStateStore, SqliteStateStore, StateStore
@@ -54,9 +56,9 @@ __version__ = "0.1.0"
 
 __all__ = [
     "AgenticAirflowError", "ApprovalError", "ConfigurationError", "DagValidationError", "OutputValidationError",
-    "RunError", "SchemaValidationError", "ToolError", "ToolPermissionError", "TriggerError", "WebhookAuthenticationError",
+    "RunError", "SchemaValidationError", "StaleProposalError", "ToolError", "ToolPermissionError", "TriggerError", "WebhookAuthenticationError",
     "Dag", "TaskGroup", "Task", "Branch", "AgenticTask", "AgenticBranch", "AgenticEvaluator", "NO_BRANCH",
-    "DagEvaluator", "attach_dag_evaluator", "trigger_items", "found_nothing",
+    "DagEvaluator", "attach_dag_evaluator", "trigger_items", "found_nothing", "Applier",
     "Engine", "EngineConfig", "ScopeConfig", "ResolvedConfig", "resolve_config",
     "ModelBackend", "FunctionBackend", "ScriptedBackend", "GenerationRequest", "GenerationResponse", "Message", "ToolCall", "ToolSpec", "OutputSpec",
     "Tool", "ToolContext", "ToolRegistry", "ToolPermissions", "tool", "resolve_permissions", "SkillStore",

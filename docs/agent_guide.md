@@ -34,7 +34,7 @@ This page is written for an AI agent (or a developer in a hurry) that needs to u
 | Add persistence backend | implement `state.StateStore` (see `InMemoryStateStore`) |
 | Add an API route | `ui/server.py::_Handler._api_get/_api_post` |
 | Change the DagEvaluator prompts/schemas | `evaluator.py` |
-| Add a proposal type (human-gated change) | `proposals.py` (+ `evaluator.apply_recommendation` to apply it, `mcp/__init__.py` to expose it) |
+| Add a proposal type (human-gated change) | `proposals.py` (a `propose_*` function and its `Applier` in `built_in_appliers`; `mcp/__init__.py` to expose it). An application adds its own kinds with `engine.appliers[kind] = Applier(...)` |
 | Add an MCP tool | `mcp/__init__.py::build_server` (inspection or proposal only; never approve/apply) |
 
 ## Invariants to preserve

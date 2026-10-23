@@ -48,6 +48,7 @@ class StateStore(Protocol):
     def save_recommendation(self, rec: dict[str, Any]) -> None: ...
     def get_recommendation(self, rec_id: str) -> dict[str, Any] | None: ...
     def list_recommendations(self, dag_id: str | None = None, run_id: str | None = None, status: str | None = None) -> list[dict[str, Any]]: ...
+    def delete_recommendation(self, rec_id: str) -> None: ...
     # trigger bookkeeping
     def get_meta(self, key: str) -> dict[str, Any] | None: ...
     def set_meta(self, key: str, value: dict[str, Any]) -> None: ...
@@ -157,6 +158,10 @@ class InMemoryStateStore:
 
     def get_recommendation(self, rec_id):
         return self._get("recommendations", rec_id)
+
+    def delete_recommendation(self, rec_id):
+        with self._lock:
+            self._docs.get("recommendations", {}).pop(rec_id, None)
 
     def list_recommendations(self, dag_id=None, run_id=None, status=None):
         items = [
@@ -317,6 +322,10 @@ class SqliteStateStore(InMemoryStateStore):
 
     def get_recommendation(self, rec_id):
         return self._read("recommendations", rec_id)
+
+    def delete_recommendation(self, rec_id):
+        with self._lock:
+            self._conn.execute("DELETE FROM documents WHERE collection='recommendations' AND key=?", (rec_id,))
 
     def list_recommendations(self, dag_id=None, run_id=None, status=None):
         return self._query("recommendations", scope=dag_id, scope2=run_id, statuses=[status] if status else None)

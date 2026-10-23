@@ -147,6 +147,7 @@ def build_server(engine: Any, *, name: str = "agentic-airflow", allow_trigger: b
             "dag_id": dag.id, "prompt": dag.prompt, "description": dag.description, "tags": list(dag.tags),
             "schedule": [s.to_dict() for s in dag.schedule], "auto_evaluate": dag.auto_evaluate,
             "max_active_runs": dag.max_active_runs, "config": dag.scope.to_dict(), "seed_context": dag.context,
+            "definition": dag.definition,
             "tasks": tasks, "groups": [g.to_dict() for g in dag.groups if g.parent is None],
             "overrides": overrides, "memory": engine.get_memory(dag_id),
             "registered_tools": [t.to_dict() for t in engine.tools], "skills": engine.skills.names(),
@@ -210,7 +211,7 @@ def build_server(engine: Any, *, name: str = "agentic-airflow", allow_trigger: b
     async def list_approvals(run_id: str | None = None) -> dict[str, Any]:
         return await wrap(lambda: [a.to_dict() for a in engine.list_approvals(run_id=run_id)])()
 
-    @server.tool(description="Recommendations/proposals and their status (pending, approved, rejected, withdrawn). Includes DagEvaluator output and your own proposals.")
+    @server.tool(description="Recommendations/proposals and their status (pending, approved, rejected, withdrawn, stale). Includes DagEvaluator output and your own proposals.")
     async def list_recommendations(dag_id: str | None = None, run_id: str | None = None, status: str | None = None) -> dict[str, Any]:
         return await wrap(engine.list_recommendations)(dag_id, run_id, status)
 
@@ -231,23 +232,33 @@ def build_server(engine: Any, *, name: str = "agentic-airflow", allow_trigger: b
         return await wrap(engine.stats)()
 
     # ------------------------------------------------------------------ proposals
-    @server.tool(description="Propose a new prompt for an agentic task. Creates a PENDING recommendation; a human must approve it before it takes effect.")
+    # Only for the kinds of proposal the application takes (engine.appliers), as the engine is when it's built.
+    takes = set(engine.appliers)
+
+    def proposal_tool(kind: str, description: str):
+        return server.tool(description=description) if kind in takes else (lambda fn: fn)
+
+    @proposal_tool("definition", "Propose a new definition for a DAG: the whole text it's read from (get_dag's 'definition'), with every change you'd make. Checked when you propose it; PENDING until a human approves it.")
+    async def propose_definition(dag_id: str, definition: str, rationale: str) -> dict[str, Any]:
+        return await wrap(proposals.propose_definition)(engine, dag_id, definition, rationale, source=SOURCE, proposed_by=client_name)
+
+    @proposal_tool("topology", "Propose a new prompt for an agentic task. Creates a PENDING recommendation; a human must approve it before it takes effect.")
     async def propose_prompt_change(dag_id: str, task_id: str, proposed_prompt: str, rationale: str) -> dict[str, Any]:
         return await wrap(proposals.propose_prompt_change)(engine, dag_id, task_id, proposed_prompt, rationale, source=SOURCE, proposed_by=client_name)
 
-    @server.tool(description="Propose adding/removing tasks or dependencies, described in plain language. Recorded for a human to implement in code; never applied automatically.")
+    @proposal_tool("topology", "Propose adding/removing tasks or dependencies, described in plain language. Recorded for a human to implement in code; never applied automatically.")
     async def propose_structural_change(dag_id: str, description: str, rationale: str) -> dict[str, Any]:
         return await wrap(proposals.propose_structural_change)(engine, dag_id, description, rationale, source=SOURCE, proposed_by=client_name)
 
-    @server.tool(description="Propose DAG-level tool permission overrides: allow (grant without approval), hide (keep on-demand), deny (block), or unset (drop an earlier override of a tool). Pending until a human approves; explicit denied_tools in code always win.")
+    @proposal_tool("tools", "Propose DAG-level tool permission overrides: allow (grant without approval), hide (keep on-demand), deny (block), or unset (drop an earlier override of a tool). Pending until a human approves; explicit denied_tools in code always win.")
     async def propose_tool_permissions(dag_id: str, rationale: str, allow: list[str] | None = None, hide: list[str] | None = None, deny: list[str] | None = None, unset: list[str] | None = None) -> dict[str, Any]:
         return await wrap(proposals.propose_tool_permissions)(engine, dag_id, allow=allow, hide=hide, deny=deny, unset=unset, rationale=rationale, source=SOURCE, proposed_by=client_name)
 
-    @server.tool(description="Propose a new version of a skill (full replacement text) or a new skill. Pending until a human approves.")
+    @proposal_tool("skills", "Propose a new version of a skill (full replacement text) or a new skill. Pending until a human approves.")
     async def propose_skill_rewrite(skill: str, content: str, rationale: str, dag_id: str | None = None) -> dict[str, Any]:
         return await wrap(proposals.propose_skill_rewrite)(engine, skill, content, rationale, dag_id=dag_id, source=SOURCE, proposed_by=client_name)
 
-    @server.tool(description="Propose replacing a DAG's persisted memory with the given JSON object. Pending until a human approves.")
+    @proposal_tool("memory", "Propose replacing a DAG's persisted memory with the given JSON object. Pending until a human approves.")
     async def propose_memory_update(dag_id: str, memory: dict[str, Any], rationale: str) -> dict[str, Any]:
         return await wrap(proposals.propose_memory_update)(engine, dag_id, memory, rationale, source=SOURCE, proposed_by=client_name)
 

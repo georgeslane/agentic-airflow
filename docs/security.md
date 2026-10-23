@@ -16,6 +16,8 @@
 
 **Agent self-modification is proposal-only.** The optional MCP server and `agentic_airflow.proposals` let agents read everything and *propose* prompt, permission, skill and memory changes; they are stored as pending recommendations and only `Engine.approve_recommendation()` (a human, via code or the UI) applies them. The MCP server has no approve/decide/cancel tools, cannot trigger runs unless explicitly enabled, and each client can only withdraw its own proposals. At most 20 proposals from one source wait for each DAG.
 
+**An application can keep its DAGs' text authoritative.** With `engine.appliers` it takes only the kinds of proposal it can apply to the text (such as whole `"definition"`s, checked when proposed), so no approved change runs that its DAG files don't show.
+
 **Stored state is versioned.** `SqliteStateStore` records its schema in the file, upgrades older files when it opens them, and refuses one written by a newer version rather than misread it.
 
 **Human approval gates**: denied tool calls, exhausted reflection loops, and every DagEvaluator change to permissions, prompts or skills. Memory compaction is applied automatically by default because it does not change behaviourally-privileged configuration; set `DagEvaluator(apply_memory=False)` to gate it too.
