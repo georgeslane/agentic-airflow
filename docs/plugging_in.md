@@ -110,6 +110,8 @@ async with engine.user_slot("qwen-3.6"):
     reply = await my_chat_model.answer(message)
 ```
 
+`Engine(queues=...)` takes a `ModelQueueSet` your application already holds, so its own background work can use the same queues (at `DAG_PRIORITY`).
+
 ## 6. Human in the loop
 
 ```python

@@ -103,7 +103,7 @@ def build_graph(dag: Dag, run: DagRun | None = None) -> dict[str, Any]:
             "follow_mapping": t.follow_mapping,
             "trigger_rule": t.trigger_rule,
             "outlets": list(t.outlets),
-            "prompt": getattr(t, "prompt", None),
+            "prompt": getattr(t, "prompt_text", None),
             "return_type": getattr(t, "return_type", None),
             "config": t.scope.to_dict(),
             "status": aggregate_status([i.status for i in insts]) if run else None,

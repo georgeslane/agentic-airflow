@@ -290,7 +290,7 @@ def apply_recommendation(engine: "Engine", rec: dict[str, Any]) -> dict[str, Any
         applied, manual = [], list(payload.get("structural_changes") or [])
         for change in payload.get("prompt_changes") or []:
             task_id = change.get("task_id")
-            if dag is not None and task_id in dag.tasks and dag.get(task_id).is_agentic:
+            if dag is not None and task_id in dag.tasks and isinstance(getattr(dag.get(task_id), "prompt", None), str):
                 prompts[task_id] = change["proposed"]
                 applied.append(task_id)
             else:

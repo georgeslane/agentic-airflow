@@ -70,8 +70,10 @@ Unselected downstream nodes and their *exclusive* descendants are `SKIPPED`. Joi
 | `max_tool_steps` | inherit (`10`) | Cap on inference steps that request tools. When spent, tools are withdrawn and the model is asked for a final answer; a further tool request fails the task. |
 | `include_run_log` / `include_dag_definition` | `False` | Render `dag_context` / the DAG definition into the prompt (used by the DagEvaluator). |
 | `system_prompt` | `None` | Extra task-level guidelines appended to the DAG objective. |
+| `prompt` | required | A string, or (from application code) `fn(engine, run) -> str`, written when the task starts. |
+| `validator` | `None` | `fn(value)`: checks the answer once it matches `return_type`; raising `OutputValidationError` sends its message back to the model (within `output_retries`); returning a value replaces the answer. |
 
-Prompt composition: system = DAG objective + task guidelines + skills + tool guidance + output contract + data notice. User message = task prompt + memory + trigger payload + upstream outputs (delimited `<<<BEGIN id>>> … <<<END id>>>` blocks) + retry history. Outputs longer than `EngineConfig.max_context_chars` are truncated with a marker.
+Prompt composition: system = DAG objective + task guidelines + skills + tool guidance + output contract + data notice. User message = memory + trigger payload (unmapped instances only) + upstream outputs (delimited `<<<BEGIN id>>> … <<<END id>>>` blocks) + retry history + workflow definition + run log + branch choices, then **the task prompt last**: models follow instructions after long context best, and tasks given the same data share a prefix a model server can cache. Outputs longer than `EngineConfig.max_context_chars` are truncated with a marker; the run log gives each entry an equal share of it, one line each.
 
 ### Tool governance
 
@@ -87,7 +89,7 @@ Resolution per task (`tools.resolve_permissions`):
 
 ## `AgenticBranch(id, prompt, *, multi_select=False, allow_none=False, **AgenticTask options)`
 
-The downstream ids are passed to the backend as an `enum` output contract (`OutputSpec(kind="enum", choices=[...])`) and listed in the prompt. Returns one id, or a list when `multi_select=True`. Skipping semantics are identical to `Branch`.
+The downstream ids are passed to the backend as an `enum` output contract (`OutputSpec(kind="enum", choices=[...])`) and listed in the prompt. Returns one id, or a list when `multi_select=True`. An answer that isn't exactly a choice but names exactly one of them as a word (``I'd say `apply` ``) counts as that choice. Skipping semantics are identical to `Branch`.
 
 `allow_none=True` adds the choice `"none"` (`NO_BRANCH`), which selects nothing, so every downstream task is skipped. A branch with one downstream task is then a yes or no: `arrived = AgenticBranch("arrived", prompt="Has the parcel come?", allow_none=True); arrived >> tell`. No downstream task may be called `none`.
 

@@ -65,7 +65,7 @@ async def test_dag_evaluator_recommendations_memory_and_approval_gate(make_engin
     async with engine:
         run2 = await engine.run("ev", timeout=5)
     work_req = [r for r in backend.requests if r.metadata["task_id"] == "work"][-1]
-    assert work_req.messages[0].content.startswith("# Task\nBetter prompt")
+    assert work_req.messages[0].content.endswith("# Task\nBetter prompt")
     assert run2.memory == {"processed_ids": [1, 2]}
 
 

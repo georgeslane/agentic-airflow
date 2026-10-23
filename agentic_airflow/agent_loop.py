@@ -118,7 +118,9 @@ def build_user_prompt(
     dag_definition: dict[str, Any] | None = None,
     choices: list[str] | None = None,
 ) -> str:
-    sections = [f"# Task\n{prompt.strip()}"]
+    # The data first and the task last: models follow instructions after long context best, and tasks given the
+    # same data (a run's end-of-run tasks, say) then share a prefix a model server can cache.
+    sections: list[str] = []
     memory = input_context.get("memory") or {}
     if memory:
         sections.append("## Memory (durable context from previous runs)\n```json\n" + _dump(memory, max_chars) + "\n```")
@@ -147,10 +149,28 @@ def build_user_prompt(
     if dag_definition is not None:
         sections.append("## Workflow definition\n```json\n" + _dump(dag_definition, max_chars) + "\n```")
     if run_log is not None:
-        sections.append("## Run log (dag_context)\n```json\n" + _dump(run_log, max_chars) + "\n```")
+        sections.append("## Run log\n" + render_run_log(run_log, max_chars))
     if choices:
         sections.append("## Available branches\n" + "\n".join(f"- `{c}`" for c in choices))
+    sections.append(f"# Task\n{prompt.strip()}")
     return "\n\n".join(sections)
+
+
+def render_run_log(run_log: list[dict[str, Any]], max_chars: int) -> str:
+    """The run log, one entry a line: what each task instance did, its tools, and what it said or why it failed.
+    Each entry gets an equal share of ``max_chars``, so the latest aren't the ones cut off."""
+    if not run_log:
+        return "(nothing has run yet)"
+    share = max(200, max_chars // len(run_log)) if max_chars else 0
+    lines = []
+    for entry in run_log:
+        tools = ", ".join(f"{c.get('name')} ({c.get('status')})" for c in entry.get("tool_calls") or [])
+        said = entry.get("error") or entry.get("output")
+        said = said if isinstance(said, str) else _dump(said)
+        head = f"- {entry.get('instance_id')} ({entry.get('status')}, attempt {entry.get('attempt', 1)})"
+        line = head + (f"; tools: {tools}" if tools else "") + f": {' '.join(str(said or '').split())}"
+        lines.append(line if not share or len(line) <= share else line[: share - 1] + "…")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +197,7 @@ async def run_agentic_instance(
         )
     dag = engine.dag_for(run)
     overrides = engine.overrides_for(run.dag_id)
-    prompt = (overrides.get("prompts") or {}).get(op.id) or op.prompt
+    prompt = (overrides.get("prompts") or {}).get(op.id) or op.render_prompt(engine, run)
     dag_prompt = (overrides.get("prompts") or {}).get("__dag__") or dag.prompt
 
     choices: list[str] | None = None
@@ -385,6 +405,9 @@ async def run_agentic_instance(
             # Final answer --------------------------------------------------------
             try:
                 value = coerce_output(response, output_spec)
+                if op.validator is not None:
+                    checked = op.validator(value)
+                    value = value if checked is None else checked
             except OutputValidationError as exc:
                 if output_retries_left > 0:
                     output_retries_left -= 1

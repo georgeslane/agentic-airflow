@@ -298,6 +298,13 @@ class AgenticTask(BaseOperator):
       into the prompt and ``include_dag_definition=True`` renders the DAG
       topology/prompts (both used by the DagEvaluator).
     * ``system_prompt`` is appended to the DAG-level objective for this task only.
+    * ``prompt`` may be a function ``fn(engine, run) -> str``, written when the
+      task starts, for prompts that depend on the run (as an application's own
+      end-of-run tasks might).
+    * ``validator`` checks the answer once it matches ``return_type``: it raises
+      :class:`~agentic_airflow.errors.OutputValidationError` to have the model
+      try again with its message (as with a malformed answer), and returns the
+      value to use, or ``None`` to keep it.
     """
 
     kind = "agentic_task"
@@ -306,7 +313,7 @@ class AgenticTask(BaseOperator):
     def __init__(
         self,
         id: str,
-        prompt: str,
+        prompt: str | Callable[..., str],
         *,
         model: str | None = None,
         allowed_tools: list[str] | None = None,
@@ -325,6 +332,7 @@ class AgenticTask(BaseOperator):
         include_run_log: bool = False,
         include_dag_definition: bool = False,
         system_prompt: str | None = None,
+        validator: Callable[[Any], Any] | None = None,
         trigger_rule: TriggerRule = "none_failed",
         on_complete: Callable[..., Any] | None = None,
         outlets: Sequence[Any] | None = None,
@@ -332,7 +340,7 @@ class AgenticTask(BaseOperator):
         dag: Any | None = None,
         group: Any | None = None,
     ):
-        if not isinstance(prompt, str) or not prompt.strip():
+        if not callable(prompt) and (not isinstance(prompt, str) or not prompt.strip()):
             raise ConfigurationError(f"AgenticTask {id!r}: prompt is required")
         return_type = return_type or "string"
         if return_type not in ("string", "list", "json", "image", "file"):
@@ -369,13 +377,22 @@ class AgenticTask(BaseOperator):
         self.include_run_log = include_run_log
         self.include_dag_definition = include_dag_definition
         self.system_prompt = system_prompt
+        self.validator = validator
+
+    @property
+    def prompt_text(self) -> str:
+        """The prompt, or what stands for one written when the task starts."""
+        return self.prompt if isinstance(self.prompt, str) else "(written when the task starts)"
+
+    def render_prompt(self, engine: Any, run: Any) -> str:
+        return self.prompt(engine, run) if callable(self.prompt) else self.prompt
 
     def output_spec(self, **_: Any) -> OutputSpec:
         return OutputSpec(kind=self.return_type, json_schema=self.json_schema)
 
     def describe(self) -> dict[str, Any]:
         data = super().describe()
-        data.update({"prompt": self.prompt, "return_type": self.return_type, "include_run_log": self.include_run_log})
+        data.update({"prompt": self.prompt_text, "return_type": self.return_type, "include_run_log": self.include_run_log})
         return data
 
 

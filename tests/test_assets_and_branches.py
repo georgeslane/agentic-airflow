@@ -221,3 +221,58 @@ async def test_on_complete_finishes_before_the_task_counts_as_done(make_engine):
     async with engine:
         run = await engine.run("hook", timeout=5)
     assert run.outputs()["b"] == "x"
+
+
+@pytest.mark.asyncio
+async def test_prompts_can_be_written_for_each_run_and_answers_checked(make_engine, backend):
+    from agentic_airflow import OutputValidationError
+
+    def check(value):
+        if "python" not in value:
+            raise OutputValidationError("Give the file in a python block.")
+        return value.upper()
+
+    backend.add("review", "no code", "here: python")
+    with Dag("dyn", prompt="p", auto_evaluate=False) as dag:
+        AgenticTask("review", prompt=lambda engine, run: f"Review run {run.trigger['payload']}.", validator=check)
+    engine = make_engine()
+    engine.register(dag)
+    async with engine:
+        run = await engine.run("dyn", "#7", timeout=5)
+    assert run.outputs()["review"] == "HERE: PYTHON"
+    first, second = backend.requests
+    assert first.messages[0].content.endswith("# Task\nReview run #7.")
+    assert "Give the file in a python block." in second.messages[-1].content
+    assert dag.get("review").describe()["prompt"] == "(written when the task starts)"
+
+
+def test_a_branch_answer_with_words_around_the_choice_is_understood():
+    from agentic_airflow import GenerationResponse, OutputSpec, OutputValidationError
+    from agentic_airflow.validation import coerce_output
+
+    spec = OutputSpec(kind="enum", choices=["apply", "skip", "none"])
+    assert coerce_output(GenerationResponse(text="I'd say `apply`, it fits."), spec) == "apply"
+    with pytest.raises(OutputValidationError):
+        coerce_output(GenerationResponse(text="apply or skip?"), spec)
+
+
+def test_the_run_log_gives_each_entry_its_share():
+    from agentic_airflow.agent_loop import render_run_log
+
+    log = [
+        {"instance_id": f"t_{i}", "status": "success", "attempt": 1, "output": "x" * 5000,
+         "tool_calls": [{"name": "fetch", "status": "ok"}]}
+        for i in range(4)
+    ]
+    text = render_run_log(log, 2000)
+    assert text.count("\n") == 3 and "t_3 (success, attempt 1); tools: fetch (ok): xxx" in text
+    assert len(text) < 2200
+
+
+@pytest.mark.asyncio
+async def test_an_engine_can_share_an_applications_queues(make_engine):
+    from agentic_airflow.priority import ModelQueueSet
+
+    queues = ModelQueueSet()
+    engine = make_engine(queues=queues)
+    assert engine.queues is queues

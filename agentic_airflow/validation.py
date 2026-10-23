@@ -188,6 +188,11 @@ def coerce_output(response: GenerationResponse, spec: OutputSpec) -> Any:
             return list(dict.fromkeys(value))
         if isinstance(value, list) and len(value) == 1:
             value = value[0]
+        if value not in choices and isinstance(value, str):
+            # Models often add a word or two: take the one choice the answer names, if it names only one.
+            named = [c for c in choices if re.search(rf"(?<![\w-]){re.escape(c)}(?![\w-])", value, re.IGNORECASE)]
+            if len(named) == 1:
+                value = named[0]
         if value not in choices:
             raise OutputValidationError(
                 f"Invalid selection {value!r}. Respond with exactly one of: {choices!r}."

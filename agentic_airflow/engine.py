@@ -76,6 +76,7 @@ class Engine:
         tools: ToolRegistry | None = None,
         skills: SkillStore | None = None,
         chat_sink: EventCallback | None = None,
+        queues: ModelQueueSet | None = None,
     ):
         self.backend = backend
         self.config = config or EngineConfig()
@@ -83,7 +84,8 @@ class Engine:
         self.tools = tools or ToolRegistry()
         self.skills = skills or SkillStore(state=self.state)
         self.chat_sink = chat_sink
-        self.queues = ModelQueueSet(self.config.model_concurrency, self.config.default_concurrency)
+        # Shared with an application that holds the same models for its own users (see user_slot).
+        self.queues = queues or ModelQueueSet(self.config.model_concurrency, self.config.default_concurrency)
         self.cpu_pool = ThreadPoolExecutor(max_workers=self.config.cpu_workers, thread_name_prefix="agentic-airflow-cpu")
         self.dags: dict[str, Dag] = {}
         self.runs: dict[str, DagRun] = {}
