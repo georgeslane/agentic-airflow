@@ -35,6 +35,7 @@ from .validation import schema_errors
 
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 SEARCH_TOOL_NAME = "search_tools"
+EXPLICIT = "explicit"  # a tool's tag: enabled only by its name, never by a pattern (resolve_permissions)
 
 ToolState = Literal["allowed", "hidden", "gated", "denied", "unknown"]
 Approval = Literal["none", "ask", "always"]
@@ -318,6 +319,9 @@ class ToolPermissions:
     """Tools offered to the task, each call of which pauses for approval."""
     always: frozenset[str] = frozenset()
     """Subset of ``gated`` whose approval can't be remembered for the rest of a run."""
+    refuse_denied: bool = False
+    """A call to a denied tool fails, saying so, rather than pausing for approval: it isn't one of the task's
+    tools at all (``enabled``)."""
 
     @property
     def offered(self) -> frozenset[str]:
@@ -372,6 +376,9 @@ def resolve_permissions(
     def matching(patterns: Iterable[str]) -> set[str]:
         return {name for p in patterns for name in fnmatch.filter(registered, p)}
 
+    if config.enabled is not None:
+        return _enabled(config, tools, matching, overrides)
+
     named = matching([*(config.allowed_tools or []), *(overrides.get("allow") or [])])
     denied_explicit = matching([*config.denied_tools, *(overrides.get("deny") or [])])
     allowed: set[str] = set()
@@ -398,6 +405,41 @@ def resolve_permissions(
         denied=frozenset(denied),
         gated=frozenset(gated),
         always=frozenset(always),
+    )
+
+
+def _enabled(
+    config: ResolvedConfig, tools: dict[str, Tool], matching: Callable[[Iterable[str]], set[str]], overrides: dict[str, Any]
+) -> ToolPermissions:
+    """Permissions once a scope sets ``enabled``: a task can use only the tools it names, less ``denied_tools``,
+    and nothing else is offered, found or run, even with approval. Of those, a tool that asks first runs without
+    asking if ``automated`` names it (or an ``allow`` override does); one that always asks always does; the rest
+    run without asking. Automating a tool doesn't enable it. A tool tagged ``"explicit"`` is enabled only by its
+    name, never by a pattern such as ``"*"``: one for a few tasks alone."""
+    allow = matching(overrides.get("allow") or [])
+    enabled = {n for n in matching(config.enabled or []) if EXPLICIT not in tools[n].tags or n in (config.enabled or [])}
+    usable = (enabled | allow) - matching([*config.denied_tools, *(overrides.get("deny") or [])])
+    automated = matching(config.automated) | allow
+    allowed: set[str] = set()
+    gated: set[str] = set()
+    always: set[str] = set()
+    for name in usable:
+        approval = tools[name].approval
+        if approval == "always":
+            gated.add(name)
+            always.add(name)
+        elif approval == "ask" and name not in automated:
+            gated.add(name)
+        else:
+            allowed.add(name)
+    hidden = (matching(config.hidden_tools) | {n for n, t in tools.items() if t.hidden} | matching(overrides.get("hide") or [])) & usable
+    return ToolPermissions(
+        allowed=frozenset(allowed),
+        hidden=frozenset(hidden),
+        denied=frozenset(set(tools) - usable),
+        gated=frozenset(gated),
+        always=frozenset(always),
+        refuse_denied=True,
     )
 
 

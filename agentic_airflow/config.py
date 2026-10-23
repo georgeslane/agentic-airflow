@@ -11,6 +11,11 @@ Resolution rules (see spec §1):
   ``denied_tools`` accumulate across scopes and always win over any
   ``allowed_tools`` entry; ``hidden_tools`` accumulate and mark allowed tools
   as on-demand (not injected into the prompt until discovered).
+* **Enabled and automated tools**: ``enabled`` and ``automated`` are lists the
+  nearest scope that sets one decides (``"*"`` is every tool). Once a scope
+  sets ``enabled``, a task can use only the tools it names, and a tool that
+  asks first runs without asking only if ``automated`` names it too
+  (``allowed_tools`` no longer counts). See :func:`~agentic_airflow.tools.resolve_permissions`.
 """
 
 from __future__ import annotations
@@ -33,6 +38,8 @@ class ScopeConfig:
     allowed_tools: list[str] | None = None
     denied_tools: list[str] | None = None
     hidden_tools: list[str] | None = None
+    enabled: list[str] | None = None
+    automated: list[str] | None = None
     max_tool_steps: int | None = None
     retries: int | None = None
     retry_delay: float | None = None
@@ -51,7 +58,10 @@ class ScopeConfig:
             raise ValueError("retry_delay must be a number of seconds >= 0")
         if self.ask_user is not None and not isinstance(self.ask_user, bool):
             raise ValueError("ask_user must be True, False or None")
-        for name in ("skills", "allowed_tools", "denied_tools", "hidden_tools"):
+        for name in ("enabled", "automated"):
+            if getattr(self, name) == "*":  # every tool
+                setattr(self, name, ["*"])
+        for name in ("skills", "allowed_tools", "denied_tools", "hidden_tools", "enabled", "automated"):
             value = getattr(self, name)
             if value is not None:
                 if isinstance(value, str):
@@ -84,6 +94,10 @@ class ResolvedConfig:
     """Seconds between a failure and the next attempt."""
     ask_user: bool = False
     """Whether an agentic task is offered the ``ask_user`` tool."""
+    enabled: frozenset[str] | None = None
+    """The tools the task can use at all (patterns): ``None`` if no scope says, and ``allowed_tools`` decides."""
+    automated: frozenset[str] = frozenset()
+    """Of the enabled tools that ask first, those that run without asking (patterns)."""
 
     def to_dict(self) -> dict:
         return {
@@ -98,6 +112,8 @@ class ResolvedConfig:
             "retries": self.retries,
             "retry_delay": self.retry_delay,
             "ask_user": self.ask_user,
+            "enabled": sorted(self.enabled) if self.enabled is not None else None,
+            "automated": sorted(self.automated),
         }
 
 
@@ -121,6 +137,8 @@ def resolve_config(scopes: Sequence[ScopeConfig]) -> ResolvedConfig:
     allowed: list[str] | None = None
     denied: list[str] = []
     hidden: list[str] = []
+    enabled: list[str] | None = None
+    automated: list[str] | None = None
 
     for scope in scopes:
         if scope.model is not None:
@@ -147,6 +165,10 @@ def resolve_config(scopes: Sequence[ScopeConfig]) -> ResolvedConfig:
             denied = _dedupe([*denied, *scope.denied_tools])
         if scope.hidden_tools:
             hidden = _dedupe([*hidden, *scope.hidden_tools])
+        if scope.enabled is not None:
+            enabled = list(scope.enabled)
+        if scope.automated is not None:
+            automated = list(scope.automated)
 
     return ResolvedConfig(
         model=model,
@@ -160,6 +182,8 @@ def resolve_config(scopes: Sequence[ScopeConfig]) -> ResolvedConfig:
         retries=retries or 0,
         retry_delay=float(retry_delay) if retry_delay is not None else DEFAULT_RETRY_DELAY,
         ask_user=bool(ask_user),
+        enabled=frozenset(enabled) if enabled is not None else None,
+        automated=frozenset(automated or []),
     )
 
 
