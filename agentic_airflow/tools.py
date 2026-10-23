@@ -395,6 +395,31 @@ def resolve_permissions(
     )
 
 
+ASK_TOOL_NAME = "ask_user"
+MAX_CHOICES = 10
+
+
+def ask_user_spec() -> ToolSpec:
+    """Schema of the built-in tool for asking a human, offered to tasks with ``ask_user=True``."""
+    return ToolSpec(
+        name=ASK_TOOL_NAME,
+        description=(
+            "Ask the user a question, and wait for their answer: only for a decision that's theirs to make, or "
+            "something only they know, not what you can find out or decide yourself. Give choices when the answer "
+            "is one of a few; they can still answer in their own words. If they don't answer in time, you're told, "
+            "and decide for yourself."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "The question, complete in itself: they may see it hours later."},
+                "choices": {"type": "array", "items": {"type": "string"}, "description": f"Up to {MAX_CHOICES} answers to offer."},
+            },
+            "required": ["question"],
+        },
+    )
+
+
 def search_tools_spec() -> ToolSpec:
     """Schema of the built-in registry lookup tool offered when hidden tools exist."""
     return ToolSpec(

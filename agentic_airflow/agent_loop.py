@@ -34,7 +34,16 @@ from .models import GenerationRequest, Message, OutputSpec, ToolCall, ToolSpec
 from .operators import AgenticBranch, AgenticTask
 from .priority import DAG_PRIORITY
 from .run import DagRun, Event, TaskInstance
-from .tools import SEARCH_TOOL_NAME, ToolContext, ToolPermissions, format_tool_result, search_tools_spec
+from .tools import (
+    ASK_TOOL_NAME,
+    MAX_CHOICES,
+    SEARCH_TOOL_NAME,
+    ToolContext,
+    ToolPermissions,
+    ask_user_spec,
+    format_tool_result,
+    search_tools_spec,
+)
 from .validation import coerce_output
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -138,14 +147,20 @@ def build_user_prompt(
     if history:
         lines = []
         for item in history:
-            lines.append(
-                f"### Attempt {item.get('attempt')}\nOutput:\n{_truncate(str(item.get('output')), max_chars)}\n"
-                f"Reviewer feedback: {item.get('reason')}"
-            )
-        sections.append(
-            "## Previous attempts were rejected\nProduce a new answer that addresses ALL feedback below; "
-            "do not repeat earlier mistakes.\n" + "\n\n".join(lines)
-        )
+            if item.get("failed"):  # it failed, and is being retried
+                called = item.get("tool_calls") or []
+                did = f"\nBefore failing it had called: {', '.join(called)}. What those did may already have happened: don't do it twice." if called else ""
+                lines.append(f"### Attempt {item.get('attempt')} failed\n{item.get('reason')}{did}")
+            else:
+                lines.append(
+                    f"### Attempt {item.get('attempt')}\nOutput:\n{_truncate(str(item.get('output')), max_chars)}\n"
+                    f"Reviewer feedback: {item.get('reason')}"
+                )
+        if all(item.get("failed") for item in history):
+            intro = "## Previous attempts failed\nThis task is being tried again. Avoid what went wrong below.\n"
+        else:
+            intro = "## Previous attempts were rejected\nProduce a new answer that addresses ALL feedback below; do not repeat earlier mistakes.\n"
+        sections.append(intro + "\n\n".join(lines))
     if dag_definition is not None:
         sections.append("## Workflow definition\n```json\n" + _dump(dag_definition, max_chars) + "\n```")
     if run_log is not None:
@@ -243,9 +258,11 @@ async def run_agentic_instance(
         specs = registry.specs(offered_now())
         if perms.hidden - set(discovered):
             specs.append(search_tools_spec())
+        if cfg.ask_user:
+            specs.append(ask_user_spec())
         return specs
 
-    tools_available = bool(perms.offered) or bool(run.approved_tools)
+    tools_available = bool(perms.offered) or bool(run.approved_tools) or cfg.ask_user
     system = build_system_prompt(engine, dag_prompt, op, cfg, perms, output_spec, tools_available=tools_available)
 
     def save_checkpoint(pending_state: dict[str, Any] | None = None) -> None:
@@ -301,10 +318,32 @@ async def run_agentic_instance(
         engine._chat_event(cfg, 1, Event("tool_call", run.run_id, run.dag_id, op.id, inst.instance_id, {"name": call.name, "arguments": call.arguments, "status": record["status"]}))
         return record
 
+    def question(call: ToolCall) -> dict[str, Any] | str:
+        """What an ask_user call asks: {"question", "choices"}, or why it can't be asked."""
+        if not cfg.ask_user:
+            return f"Error: {ASK_TOOL_NAME} isn't available to this task: decide for yourself."
+        args = call.arguments or {}
+        text = str(args.get("question") or "").strip()
+        choices = args.get("choices") or []
+        if not text:
+            return f"Error: {ASK_TOOL_NAME} needs a question."
+        if not isinstance(choices, list) or len(choices) > MAX_CHOICES:
+            return f"Error: choices is a list of at most {MAX_CHOICES} answers."
+        return {"question": text, "choices": [str(c).strip() for c in choices if str(c).strip()]}
+
     async def process_tool_calls(calls: list[ToolCall], start: int) -> dict[str, Any] | None:
-        """Execute ``calls[start:]``. Returns an approval payload if a denied tool is hit."""
+        """Execute ``calls[start:]``. Returns an approval payload if a denied tool is hit, or a question for the
+        user."""
         for index in range(start, len(calls)):
             call = calls[index]
+            if call.name == ASK_TOOL_NAME:
+                asked = question(call)
+                if isinstance(asked, str):
+                    messages.append(Message(role="tool", name=call.name, tool_call_id=call.id, content=asked))
+                    inst.tool_calls.append({"id": call.id, "name": call.name, "arguments": call.arguments, "status": "error", "result": asked, "step": tool_steps})
+                    continue
+                save_checkpoint({"calls": [c.to_dict() for c in calls], "index": index, "decision": None})
+                return {"tool_call": call.to_dict(), "reason": "question", **asked}
             state = perms.state(call.name, registered=call.name in registry)
             if call.name == SEARCH_TOOL_NAME or (call.name in run.approved_tools and call.name not in perms.always):
                 state = "allowed"
@@ -334,7 +373,16 @@ async def run_agentic_instance(
             calls = [ToolCall.from_dict(c) for c in pending["calls"]]
             index = int(pending["index"])
             call = calls[index]
-            if decision.get("approved"):
+            if "answer" in decision:  # a question, answered or not
+                answer = decision.get("answer")
+                if answer:
+                    text, status = f"The user answered: {answer}", "answered"
+                else:
+                    why = decision.get("reason") or "They didn't answer."
+                    text, status = f"No answer: {why} Decide for yourself, without asking again.", "unanswered"
+                messages.append(Message(role="tool", name=call.name, tool_call_id=call.id, content=text))
+                inst.tool_calls.append({"id": call.id, "name": call.name, "arguments": call.arguments, "status": status, "result": text, "step": tool_steps})
+            elif decision.get("approved"):
                 if decision.get("remember") and call.name not in run.approved_tools and call.name not in perms.always:
                     run.approved_tools.append(call.name)
                 record = await execute_tool_call(call, force=True)

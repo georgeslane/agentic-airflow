@@ -68,6 +68,10 @@ class BaseOperator:
       produced something: DAGs scheduled on them run with what it produced.
     * ``skip_if``: optional ``fn(engine, run) -> str | None`` checked when the
       node is about to be scheduled: a returned reason skips it.
+    * ``retries`` / ``retry_delay``: how many times the node is run again after
+      it fails, and the seconds between (inherited from the group, DAG and
+      engine when ``None``; default no retries, 60 seconds). A failure raised as
+      :class:`~agentic_airflow.errors.PermanentError` isn't retried.
     """
 
     kind: ClassVar[str] = "task"
@@ -242,6 +246,8 @@ class Task(BaseOperator):
         on_complete: Callable[..., Any] | None = None,
         outlets: Sequence[Any] | None = None,
         skip_if: Callable[..., str | None] | None = None,
+        retries: int | None = None,
+        retry_delay: float | None = None,
         dag: Any | None = None,
         group: Any | None = None,
     ):
@@ -258,6 +264,7 @@ class Task(BaseOperator):
             skip_if=skip_if,
             dag=dag,
             group=group,
+            scope=ScopeConfig(retries=retries, retry_delay=retry_delay),
         )
         self.fn = fn
         self.wants_ctx = _accepts_ctx(fn)
@@ -274,8 +281,8 @@ class Branch(Task):
     kind = "branch"
     is_branch = True
 
-    def __init__(self, id: str, fn: Callable[..., Any], *, context: Any = None, follow_mapping: bool = False, dag: Any | None = None, group: Any | None = None, on_complete: Callable[..., Any] | None = None, skip_if: Callable[..., str | None] | None = None):
-        super().__init__(id, fn, context=context, follow_mapping=follow_mapping, dag=dag, group=group, on_complete=on_complete, skip_if=skip_if)
+    def __init__(self, id: str, fn: Callable[..., Any], *, context: Any = None, follow_mapping: bool = False, dag: Any | None = None, group: Any | None = None, on_complete: Callable[..., Any] | None = None, skip_if: Callable[..., str | None] | None = None, retries: int | None = None, retry_delay: float | None = None):
+        super().__init__(id, fn, context=context, follow_mapping=follow_mapping, dag=dag, group=group, on_complete=on_complete, skip_if=skip_if, retries=retries, retry_delay=retry_delay)
 
 
 def _accepts_ctx(fn: Callable[..., Any]) -> bool:
@@ -303,6 +310,9 @@ class AgenticTask(BaseOperator):
     * ``prompt`` may be a function ``fn(engine, run) -> str``, written when the
       task starts, for prompts that depend on the run (as an application's own
       end-of-run tasks might).
+    * ``ask_user=True`` offers the task the ``ask_user`` tool: it asks a human a
+      question, with optional choices, and the task waits (without holding its
+      model) until :meth:`Engine.answer` answers it, or it expires.
     * ``validator`` checks the answer once it matches ``return_type``: it raises
       :class:`~agentic_airflow.errors.OutputValidationError` to have the model
       try again with its message (as with a malformed answer), and returns the
@@ -339,6 +349,9 @@ class AgenticTask(BaseOperator):
         on_complete: Callable[..., Any] | None = None,
         outlets: Sequence[Any] | None = None,
         skip_if: Callable[..., str | None] | None = None,
+        retries: int | None = None,
+        retry_delay: float | None = None,
+        ask_user: bool | None = None,
         dag: Any | None = None,
         group: Any | None = None,
     ):
@@ -359,6 +372,9 @@ class AgenticTask(BaseOperator):
             denied_tools=denied_tools,
             hidden_tools=hidden_tools,
             max_tool_steps=max_tool_steps,
+            retries=retries,
+            retry_delay=retry_delay,
+            ask_user=ask_user,
         )
         super().__init__(
             id,

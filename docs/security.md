@@ -24,6 +24,10 @@
 
 **No trigger loops**: a run started by an asset update or another DAG carries the chain of DAGs that led to it, and never starts one of them again; a DAG can't be scheduled on its own outlets or trigger itself.
 
-**Resource bounds**: `max_tool_steps` and `task_timeout` per task, `output_retries`, `max_context_chars` truncation, `max_mapped` instances per fan-out, `max_active_runs` per DAG and `max_active_runs_per_model`, per-model concurrency, cron firings that don't pile up, `keep_runs`, bounded cron look-ahead.
+**Asking a human is a tool the application chooses to offer** (`ask_user`, off by default), and the answer reaches the task as a tool result: the application decides who may answer, as with approvals. An unanswered question expires with `approval_timeout`, and the task decides for itself.
+
+**Retries don't repeat effects blindly**: a retried agentic task is told which tools it had already called, and tools that ask first ask again.
+
+**Resource bounds**: `retries` per task, `max_tool_steps` and `task_timeout` per task, `output_retries`, `max_context_chars` truncation, `max_mapped` instances per fan-out, `max_active_runs` per DAG and `max_active_runs_per_model`, per-model concurrency, cron firings that don't pile up, `keep_runs`, bounded cron look-ahead.
 
 Things the library does *not* do: sandbox your tool functions, rate-limit the model backend (do it in the backend), or authenticate `engine.chat()` callers (your application decides who may ask).
