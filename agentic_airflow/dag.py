@@ -8,7 +8,7 @@ from typing import Any, Iterable
 from . import _context
 from .config import ScopeConfig, Thinking
 from .errors import DagValidationError
-from .operators import AgenticBranch, AgenticEvaluator, BaseOperator, Branch
+from .operators import NO_BRANCH, AgenticBranch, AgenticEvaluator, BaseOperator, Branch
 from .triggers import Trigger, normalise_schedule
 
 DAG_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
@@ -25,7 +25,10 @@ class TaskGroup:
         with TaskGroup("research", skills=["Research"]):
             a = AgenticTask("search", prompt="...")
 
-    Groups can be nested and reused (e.g. the built-in DagEvaluator).
+    Groups can be nested and reused (e.g. the built-in DagEvaluator). As in
+    Airflow, a group can be used with ``>>`` and ``<<``: before something it
+    stands for its last tasks (those with nothing after them in the group),
+    after something for its first.
     """
 
     is_dag = False
@@ -107,6 +110,43 @@ class TaskGroup:
             out.extend(g.all_tasks())
         return out
 
+    # -- dependency syntax: the group's first and last tasks ------------------
+    def roots(self) -> list[BaseOperator]:
+        """Its tasks with nothing before them in the group."""
+        inside = self.all_tasks()
+        return [t for t in inside if not any(u in inside for u in t.upstream)]
+
+    def leaves(self) -> list[BaseOperator]:
+        """Its tasks with nothing after them in the group."""
+        inside = self.all_tasks()
+        return [t for t in inside if not any(d in inside for d in t.downstream)]
+
+    def _ends(self, last: bool) -> list[BaseOperator]:
+        ends = self.leaves() if last else self.roots()
+        if not ends:
+            raise DagValidationError(f"TaskGroup {self.id!r} has no tasks to depend on")
+        return ends
+
+    def __rshift__(self, other: Any) -> Any:
+        for t in self._ends(last=True):
+            t.set_downstream(_first_tasks(other))
+        return other
+
+    def __rrshift__(self, other: Any) -> "TaskGroup":
+        for t in self._ends(last=False):
+            t.set_upstream(_last_tasks(other))
+        return self
+
+    def __lshift__(self, other: Any) -> Any:
+        for t in self._ends(last=False):
+            t.set_upstream(_last_tasks(other))
+        return other
+
+    def __rlshift__(self, other: Any) -> "TaskGroup":
+        for t in self._ends(last=True):
+            t.set_downstream(_first_tasks(other))
+        return self
+
     def scope_chain(self) -> list[ScopeConfig]:
         chain: list[ScopeConfig] = []
         node: TaskGroup | None = self
@@ -132,6 +172,16 @@ class TaskGroup:
             "groups": [g.to_dict() for g in self.groups],
             "config": self.scope.to_dict(),
         }
+
+
+def _first_tasks(other: Any) -> list[BaseOperator]:
+    items = other if isinstance(other, (list, tuple, set)) else [other]
+    return [t for item in items for t in (item.roots() if isinstance(item, TaskGroup) else [item])]
+
+
+def _last_tasks(other: Any) -> list[BaseOperator]:
+    items = other if isinstance(other, (list, tuple, set)) else [other]
+    return [t for item in items for t in (item.leaves() if isinstance(item, TaskGroup) else [item])]
 
 
 class Dag:
@@ -252,6 +302,15 @@ class Dag:
     def leaves(self) -> list[BaseOperator]:
         return [t for t in self.tasks.values() if not t.downstream]
 
+    def own_tasks(self) -> list[BaseOperator]:
+        """The tasks of the DAG itself: all but those of its evaluator group."""
+        group = self.evaluator_group
+        return [t for t in self.tasks.values() if group is None or t.group is not group]
+
+    def outlets(self) -> list[str]:
+        """The assets the DAG's tasks update."""
+        return list(dict.fromkeys(name for t in self.tasks.values() for name in t.outlets))
+
     def topological_order(self) -> list[BaseOperator]:
         indeg = {t.id: len(t.upstream) for t in self.tasks.values()}
         ready = [t for t in self.tasks.values() if indeg[t.id] == 0]
@@ -335,8 +394,24 @@ class Dag:
                         )
                 if op.target.is_evaluator:
                     raise DagValidationError(f"AgenticEvaluator {op.id!r} cannot evaluate another evaluator")
-            if isinstance(op, (Branch, AgenticBranch)) and not op.downstream:
-                raise DagValidationError(f"Branch {op.id!r} has no downstream tasks to select from")
+                others = [d.id for d in op.target.downstream if not d.is_evaluator]
+                if others:
+                    # They would run on the first output, before the evaluator could have it redone.
+                    raise DagValidationError(
+                        f"Task {op.target.id!r} is evaluated by {op.id!r}, so the tasks that use its output "
+                        f"({others}) must come after {op.id!r}, not after {op.target.id!r}"
+                    )
+            if isinstance(op, (Branch, AgenticBranch)):
+                if not op.downstream:
+                    raise DagValidationError(f"Branch {op.id!r} has no downstream tasks to select from")
+                if op.outlets:
+                    raise DagValidationError(
+                        f"Branch {op.id!r} can't have outlets: give them to the tasks it selects"
+                    )
+                if isinstance(op, AgenticBranch) and op.allow_none and NO_BRANCH in op.downstream_ids:
+                    raise DagValidationError(
+                        f"Branch {op.id!r} allows none, so no task after it can be called {NO_BRANCH!r}"
+                    )
         self._validated = True
         return self
 

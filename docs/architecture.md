@@ -13,6 +13,7 @@ agentic_airflow/
   run.py         DagRun, TaskInstance, statuses, RunLogEntry (dag_context), Approval, Event
   priority.py    per-model priority queues (tier 0 user, tier 1 aging-FIFO DAG work)
   agent_loop.py  one agentic instance: prompt building, step loop, tool execution, checkpoints
+  helpers.py     ready-made functions: trigger_items, found_nothing
   engine.py      Engine: registration, triggers, run driver, node expansion, HITL, chat, recommendations
   evaluator.py   DagEvaluator group + recommendation application
   state.py       StateStore protocol, InMemoryStateStore, SqliteStateStore
@@ -22,17 +23,18 @@ agentic_airflow/
 
 ## Run lifecycle
 
-1. `engine.trigger()` creates a `DagRun` (`PENDING`) with `memory = {**dag.context, **persisted_memory}` and the trigger payload, persists it and starts a driver task if `max_active_runs` allows.
-2. The driver loop: **expand** ready nodes → **launch** ready instances → wait for a wake-up (an instance finished, an approval was resolved) → repeat until every node is expanded and every instance is terminal.
+1. `engine.trigger()` creates a `DagRun` (`PENDING`) with `memory = {**dag.context, **persisted_memory}` and the trigger payload, persists it and starts a driver task if the DAG's `max_active_runs` and the engine's `max_active_runs_per_model` allow. Waiting runs start first come, first served; a run counts against its DAG's model (the DAG-level resolved model) from when it starts until it finishes, paused or not. A run keeps the `Dag` object it started with, so `register(dag, replace=True)` never changes a run halfway; runs still waiting start with the new definition, and `unregister()` cancels them.
+2. The driver loop: **expand** ready nodes → **launch** ready instances → **finish** nodes whose instances are all terminal (emit `node.finished`, update their outlets' assets) → wait for a wake-up (an instance finished, an approval was resolved) → repeat until every node is expanded and every instance is terminal.
 3. A node is *expanded* once all its upstream nodes are expanded and all their instances are terminal. Expansion creates `TaskInstance`s (one per lane) with `depends_on` and `bindings` that describe how to assemble the input at launch time (`("output", inst)`, `("item", inst, i)`, `("fanin", [insts])`). Binding at launch time (not expansion) is what makes evaluator reruns see fresh outputs.
 4. Instances are launched as asyncio tasks when their `depends_on` are terminal. `Task`/`Branch` run on the CPU pool; agentic instances run `agent_loop.run_agentic_instance`.
 5. Terminal statuses: `SUCCESS`, `FAILED`, `SKIPPED`, `UPSTREAM_FAILED`. Waiting statuses: `AWAITING_TOOL_APPROVAL`, `AWAITING_USER`. When nothing is active and something is waiting, the run is `PAUSED` (and `wait()` returns); resolving the approval wakes the driver.
-6. Final run status: `FAILED` if any instance failed, else `SUCCESS`; `CANCELLED` via `engine.cancel()`. DagTriggers of other DAGs fire; queued runs of the same DAG start.
+6. Final run status: `FAILED` if any instance of the DAG's own tasks failed (not the evaluator's), else `SUCCESS`; `CANCELLED` via `engine.cancel()`. DagTriggers of other DAGs fire; waiting runs start. The finished run leaves `engine.runs` (it's read back from the state store when asked for), and runs beyond `keep_runs` are deleted.
 
 ## Expansion algorithm (per node)
 
 ```
 if trigger_rule == none_failed and any upstream instance failed → single UPSTREAM_FAILED instance
+if skip_if(engine, run) gives a reason → single SKIPPED instance
 lanes =
   if an upstream fan_out node produced lists  → one lane per (upstream instance, item): path = up.path + (i,)
   elif follow_mapping and an upstream is mapped → one lane per upstream lane path (deepest level)
@@ -51,27 +53,28 @@ instance id = node.id + "_" + "_".join(path)
 
 ```
 checkpoint = instance.checkpoint or {messages: [user prompt], tool_steps: 0, discovered: []}
-loop:
-  acquire a slot on the model's queue (priority 1, key = run.created_at)      ┐ one atomic
-  response = backend.generate(request)                                        │ inference
-  release slot                                                                ┘ step
-  if response.tool_calls:
-      for each call: allowed/hidden-discovered → execute; denied → checkpoint, pause (AWAITING_TOOL_APPROVAL)
+acquire a slot on the model's queue (priority 1, key = run.created_at)      ┐ atomic="task":
+loop:                                                                       │ the whole task
+  if task_timeout has passed since the slot was acquired → fail             │
+  response = backend.generate(request)   (atomic="step": slot held here only)
+  if response.tool_calls:                                                   │
+      for each call: allowed/hidden-discovered → execute;                   │
+                     gated/denied → checkpoint, release, pause (AWAITING_TOOL_APPROVAL)
       tool_steps += 1; if tool_steps == max_tool_steps: ask for a final answer with no tools
-  else:
+  else:                                                                     │
       validate against return_type; on failure send feedback once; then succeed/fail
-  checkpoint (persisted when persist_every_step)
+  checkpoint (persisted when persist_every_step)                            ┘
 ```
 
-Tool execution happens *after* the model slot is released, so a slow tool never blocks other tasks or user chat waiting for the model; interruption still only happens at step boundaries, which keeps the conversation state consistent.
+With `atomic="task"` (the default) a task is never interrupted: a live user request waits for it to finish, then goes before the next task. With `atomic="step"` the slot is held only while the backend generates, so users cut in between steps and tools run without holding the model. Either way a task waiting for approval holds nothing.
 
 ## Priority queue
 
-`ModelQueueSet` keeps one `ModelQueue` per model id with `concurrency` slots (default 1 for local models). Waiters are ordered by `(priority, order_key, arrival)`. `engine.chat()` acquires at priority 0 with key 0, so it runs right after the current step finishes. DAG steps use priority 1 with the run's creation time as key, which implements "longest waiting DAG run first".
+`ModelQueueSet` keeps one `ModelQueue` per model id with `concurrency` slots (default 1 for local models). Waiters are ordered by `(priority, order_key, arrival)`. `engine.user_slot(model)` and `engine.chat()` acquire at priority 0 with key 0, so live user requests form a first-come heap that runs as soon as the current task (or step) finishes, before any DAG work. DAG tasks use priority 1 with the run's creation time as key, which implements "longest waiting DAG run first".
 
 ## Persistence
 
-Every state change calls `state.save_run(run.to_dict())` (JSON). Approvals, recommendations, memory, overrides and skills have their own collections. `SqliteStateStore` keeps everything in one `documents` table (WAL mode). `resume()` reloads a run, turns `RUNNING/QUEUED` instances back into `PENDING` (they restart from their last checkpoint messages) and re-queues the run. `engine.stop()` detaches drivers without cancelling.
+Every state change calls `state.save_run(run.to_dict())` (JSON). `state.delete_run()` deletes a run with its approvals (`keep_runs`). Approvals, recommendations, memory, overrides and skills have their own collections. `SqliteStateStore` keeps everything in one `documents` table (WAL mode). `resume()` reloads a run, turns `RUNNING/QUEUED` instances back into `PENDING` (they restart from their last checkpoint messages) and re-queues the run. `engine.stop()` detaches drivers without cancelling.
 
 ## DagEvaluator
 

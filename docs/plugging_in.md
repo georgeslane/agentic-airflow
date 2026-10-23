@@ -33,6 +33,7 @@ Rules:
 * Return `tool_calls` to request tools; otherwise the step is final and the engine validates `output` (preferred) or `text` against `request.output`.
 * It must be safe to call concurrently (the engine runs parallel branches and multiple DAGs).
 * Raise an exception to fail the task; the error text is recorded on the instance.
+* `request.metadata` says which run, task and instance it's for, so a backend can add its own context to `request.system`.
 
 Helpers: `FunctionBackend(fn)` wraps a plain sync/async callable returning a `GenerationResponse`, a string, or a dict. `ScriptedBackend` queues canned responses per task id for tests.
 
@@ -64,6 +65,16 @@ engine = Engine(backend, tools=registry)
 
 Sync tools run on the engine's thread pool; async tools are awaited. Arguments are validated against the schema before execution; validation errors and exceptions are returned to the model as `Error: …` tool results (the task does not crash). Results are serialised to JSON for the model and truncated at `max_context_chars`.
 
+```python
+@tool(description="Send an email", approval="ask")      # offered, but each call waits for a human's OK
+async def send_email(to: str, body: str, ctx) -> str:   # ctx: a ToolContext (run_id, dag_id, task_id, instance_id, run, engine)
+    ...
+```
+
+`approval="ask"` tools are offered to the model, and each call pauses the task for approval unless the task's `allowed_tools` names the tool; `approval="always"` ones always pause. A function with a `ctx` parameter gets a `ToolContext` saying which run, task and instance called it (`ctx` isn't part of the tool's schema).
+
+For tool sets that change, such as an MCP server's, `registry.add_provider(fn)` adds a function returning `Tool`s, called whenever the registry is consulted (cache them in it if building them is slow).
+
 If your framework already owns tool execution, expose its tools through the registry (thin wrappers) rather than executing them inside `generate`; otherwise the permission model and approvals cannot work.
 
 ## 3. Skills
@@ -82,7 +93,7 @@ engine.subscribe(lambda event: log.info("%s %s %s", event.type, event.task_id, e
 engine = Engine(backend, chat_sink=my_chat.post)   # receives only what each task's verbosity allows
 ```
 
-Event types: `run.created|started|paused|resumed|finished|detached|summary`, `task.started|finished|failed|skipped|upstream_failed|rerun_requested|awaiting_tool_approval|awaiting_user`, `tool_call`, `reasoning`, `response`, `approval.requested|resolved`, `recommendation.created|approved|rejected`, `memory.updated`, `chat.answered`. Each `Event` carries `run_id`, `dag_id`, `task_id`, `instance_id`, `payload`, `timestamp`.
+Event types: `run.created|started|paused|resumed|finished|detached|summary`, `node.finished` (all of a node's instances have finished), `task.started|finished|failed|skipped|upstream_failed|rerun_requested|awaiting_tool_approval|awaiting_user`, `tool_call`, `reasoning`, `response`, `approval.requested|resolved`, `recommendation.created|approved|rejected`, `memory.updated`, `asset.updated`, `chat.answered`. Each `Event` carries `run_id`, `dag_id`, `task_id`, `instance_id`, `payload`, `timestamp`.
 
 `run.dag_context` is the append-only structured log (`{timestamp, task_id, instance_id, status, input_context, tool_calls, output, error, attempt}`), available during and after the run and used by `engine.chat()` and the DagEvaluator.
 
@@ -92,7 +103,16 @@ Event types: `run.created|started|paused|resumed|finished|detached|summary`, `ta
 answer = await engine.chat("Which emails did you archive?", run_id=run.run_id)
 ```
 
-The question is answered from the run logs at priority 0 on the model's queue: it executes as soon as the currently running inference step completes, before any queued DAG step. Pass `history=[Message(...)]` for multi-turn chat.
+The question is answered from the run logs at priority 0 on the model's queue: it executes as soon as the running task finishes (or, with `atomic="step"`, the running inference step), before any queued DAG work. Pass `history=[Message(...)]` for multi-turn chat.
+
+If your application has its own conversation with the same model, hold the model the same way, so it neither interrupts a DAG task nor waits behind queued ones:
+
+```python
+async with engine.user_slot("qwen-3.6"):
+    reply = await my_chat_model.answer(message)
+```
+
+`Engine(queues=...)` takes a `ModelQueueSet` your application already holds, so its own background work can use the same queues (at `DAG_PRIORITY`).
 
 ## 6. Human in the loop
 
@@ -123,4 +143,6 @@ await engine.trigger("inbox", payload={"since": "yesterday"})            # manua
 await engine.deliver_webhook("gh_push", raw_body=body, signature=sig)  # WebhookTrigger("gh_push", secret=...)
 ```
 
-Cron triggers fire from the scheduler loop started by `engine.start()` / `async with engine`. Missed schedules (while the process was down) are not back-filled. `DagTrigger("other")` runs are triggered with payload `{"triggered_by", "dag_id", "status", "outputs"}`.
+Cron triggers fire from the scheduler loop started by `engine.start()` / `async with engine`. Missed schedules (while the process was down) are not back-filled, and a cron firing doesn't queue another run while one of the DAG's is still waiting to start. `DagTrigger("other")` runs are triggered with payload `{"triggered_by", "dag_id", "status", "outputs"}`. `Asset("name")` runs start when a task with the asset in its `outlets` produces something, or on `await engine.update_asset("name", payload)`.
+
+`engine.pause(dag_id)` stops everything but `trigger()` (a manual run) from starting a DAG, and survives restarts; `engine.unpause(dag_id)` undoes it.

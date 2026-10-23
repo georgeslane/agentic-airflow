@@ -21,6 +21,7 @@ import uuid
 from typing import TYPE_CHECKING, Any
 
 from .dag import Dag, TaskGroup
+from .helpers import found_nothing
 from .operators import AgenticTask
 from .run import DagRun, Event, TaskInstance
 
@@ -177,11 +178,15 @@ def DagEvaluator(
     denied_tools: list[str] | None = None,
     apply_memory: bool = True,
     max_tool_steps: int = 0,
+    skip_when_idle: bool = False,
 ) -> TaskGroup:
     """Build the five-task evaluator group (not yet attached to a DAG).
 
     By default evaluator tasks get **no tools** (``allowed_tools=[]``,
     ``max_tool_steps=0``) so they cannot act on the world while auditing.
+    ``skip_when_idle=True`` skips all five when the run found nothing
+    (:func:`~agentic_airflow.helpers.found_nothing`), so a DAG that checks for
+    something often costs little when there's nothing new.
     """
     group = TaskGroup(
         id, model=model, skills=skills, thinking=thinking,
@@ -189,7 +194,8 @@ def DagEvaluator(
         denied_tools=denied_tools, max_tool_steps=max_tool_steps, dag=None, parent=None,
     )
     group.dag = None
-    common = dict(context=[], trigger_rule="all_done", include_run_log=True, group=group, return_type="json")
+    skip_if = found_nothing if skip_when_idle else None
+    common = dict(context=[], trigger_rule="all_done", include_run_log=True, group=group, return_type="json", skip_if=skip_if)
     critique = AgenticTask(
         f"{id}.workflow_critique",
         prompt=(
@@ -238,7 +244,7 @@ def DagEvaluator(
             "upstream outputs). Finish with a short bullet list of the recommendations awaiting the user's approval."
         ),
         context=[critique, tool_audit, skill_rewriter, compactor], trigger_rule="all_done", return_type="string",
-        on_complete=_on_summary, group=group,
+        on_complete=_on_summary, group=group, skip_if=skip_if,
     )
     for t in (critique, tool_audit, skill_rewriter, compactor):
         t >> summary
@@ -284,7 +290,7 @@ def apply_recommendation(engine: "Engine", rec: dict[str, Any]) -> dict[str, Any
         applied, manual = [], list(payload.get("structural_changes") or [])
         for change in payload.get("prompt_changes") or []:
             task_id = change.get("task_id")
-            if dag is not None and task_id in dag.tasks and dag.get(task_id).is_agentic:
+            if dag is not None and task_id in dag.tasks and isinstance(getattr(dag.get(task_id), "prompt", None), str):
                 prompts[task_id] = change["proposed"]
                 applied.append(task_id)
             else:
