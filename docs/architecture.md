@@ -28,7 +28,7 @@ agentic_airflow/
 3. A node is *expanded* once all its upstream nodes are expanded and all their instances are terminal. Expansion creates `TaskInstance`s (one per lane) with `depends_on` and `bindings` that describe how to assemble the input at launch time (`("output", inst)`, `("item", inst, i)`, `("fanin", [insts])`). Binding at launch time (not expansion) is what makes evaluator reruns see fresh outputs.
 4. Instances are launched as asyncio tasks when their `depends_on` are terminal. `Task`/`Branch` run on the CPU pool; agentic instances run `agent_loop.run_agentic_instance`.
 5. Terminal statuses: `SUCCESS`, `FAILED`, `SKIPPED`, `UPSTREAM_FAILED`. Waiting statuses: `AWAITING_TOOL_APPROVAL`, `AWAITING_USER`. When nothing is active and something is waiting, the run is `PAUSED` (and `wait()` returns); resolving the approval wakes the driver.
-6. Final run status: `FAILED` if any instance failed, else `SUCCESS`; `CANCELLED` via `engine.cancel()`. DagTriggers of other DAGs fire; waiting runs start. The finished run leaves `engine.runs` (it's read back from the state store when asked for), and runs beyond `keep_runs` are deleted.
+6. Final run status: `FAILED` if any instance of the DAG's own tasks failed (not the evaluator's), else `SUCCESS`; `CANCELLED` via `engine.cancel()`. DagTriggers of other DAGs fire; waiting runs start. The finished run leaves `engine.runs` (it's read back from the state store when asked for), and runs beyond `keep_runs` are deleted.
 
 ## Expansion algorithm (per node)
 

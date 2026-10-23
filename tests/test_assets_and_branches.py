@@ -276,3 +276,17 @@ async def test_an_engine_can_share_an_applications_queues(make_engine):
     queues = ModelQueueSet()
     engine = make_engine(queues=queues)
     assert engine.queues is queues
+
+
+@pytest.mark.asyncio
+async def test_an_evaluator_task_failing_doesnt_fail_the_run(make_engine, backend):
+    backend.add("work", "done")
+    backend.default = "not json"  # every evaluator task fails to parse
+    with Dag("ev_fails", prompt="p") as dag:
+        AgenticTask("work", prompt="x")
+    engine = make_engine()
+    engine.register(dag)
+    async with engine:
+        run = await engine.run("ev_fails", timeout=5)
+    assert run.status == RunStatus.SUCCESS
+    assert run.instances["dag_evaluator.workflow_critique"].status.value == "failed"

@@ -628,7 +628,7 @@ class Engine:
                 self._launch_ready_instances(run, dag)
                 await self._finish_nodes(run, dag)
                 if self._all_done(run, dag):
-                    final = self._compute_final_status(run)
+                    final = self._compute_final_status(run, dag)
                     break
                 active = any(i.status in ACTIVE_STATUSES for i in run.instances.values())
                 waiting = any(i.is_waiting for i in run.instances.values())
@@ -716,8 +716,11 @@ class Engine:
         except Exception:  # noqa: BLE001
             log.exception("couldn't delete old runs of %s", dag_id)
 
-    def _compute_final_status(self, run: DagRun) -> RunStatus:
-        if any(i.status in (TaskStatus.FAILED, TaskStatus.UPSTREAM_FAILED) for i in run.instances.values()):
+    def _compute_final_status(self, run: DagRun, dag: Dag) -> RunStatus:
+        """FAILED if any of the DAG's own tasks failed; the evaluator's failing (say, one critique that wouldn't
+        parse) is in the run log, but doesn't make the run a failure."""
+        own = {t.id for t in dag.own_tasks()}
+        if any(i.status in (TaskStatus.FAILED, TaskStatus.UPSTREAM_FAILED) for i in run.instances.values() if i.task_id in own):
             return RunStatus.FAILED
         return RunStatus.SUCCESS
 
