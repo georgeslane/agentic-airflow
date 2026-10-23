@@ -1,17 +1,28 @@
 """Human-gated change proposals.
 
 Anything (an agent via the MCP server, the DagEvaluator, your own code) can
-*propose* a change to a DAG's prompts, tool permissions, skills or memory.
-Proposals are stored as recommendations with status ``pending`` and take
-effect only when a human calls :meth:`Engine.approve_recommendation` (or
-clicks approve in the UI). Nothing in this module applies a change.
+*propose* a change to a DAG's prompts, tool permissions, skills or memory, or,
+in an application that reads DAGs from text, its whole definition. Proposals
+are stored as recommendations with status ``pending`` and take effect only when
+a human calls :meth:`Engine.approve_recommendation` (or clicks approve in the
+UI), which applies each with ``engine.appliers[kind]``.
+
+An application decides which kinds it takes, and how each is applied: the
+built-in ones apply prompt and tool changes as overrides kept in the state
+store. An application whose DAGs are read from files can remove those, and add
+``"definition"``, applied by writing the file::
+
+    engine.appliers["definition"] = Applier(apply=save_definition, check=check_definition)
+    for kind in ("topology", "tools", "memory"):
+        del engine.appliers[kind]
 """
 
 from __future__ import annotations
 
 import time
 import uuid
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable
 
 from .errors import ApprovalError, ConfigurationError
 from .run import Event
@@ -25,7 +36,34 @@ MAX_PROMPT = 50_000
 MAX_PENDING = 20  # from one source, for one DAG: withdraw or decide some before proposing more
 
 
-def _store(engine: "Engine", *, dag_id: str | None, kind: str, title: str, payload: dict[str, Any], rationale: str, source: str, proposed_by: str | None) -> dict[str, Any]:
+@dataclass
+class Applier:
+    """How an engine applies one kind of proposal, once a human approves it, and checks one as it's made.
+
+    ``apply(engine, rec)`` makes the change and returns what changed (a dict; it may be a coroutine). It raises
+    :class:`~agentic_airflow.errors.StaleProposalError` if the proposal no longer fits, which marks it stale.
+    ``check(engine, rec)``, if given, runs before a proposal is stored: it raises ``ConfigurationError`` saying why
+    one won't do, which the proposer is told.
+    """
+
+    apply: Callable[["Engine", dict[str, Any]], Any]
+    check: Callable[["Engine", dict[str, Any]], None] | None = None
+
+
+def built_in_appliers() -> dict[str, Applier]:
+    """The kinds an engine takes unless its application says otherwise."""
+    return {
+        "topology": Applier(_apply_topology),
+        "tools": Applier(_apply_tools),
+        "skills": Applier(_apply_skills),
+        "memory": Applier(_apply_memory),
+    }
+
+
+def _store(engine: "Engine", *, dag_id: str | None, kind: str, title: str, payload: dict[str, Any], rationale: str, source: str, proposed_by: str | None, run_id: str | None = None) -> dict[str, Any]:
+    applier = engine.appliers.get(kind)
+    if applier is None:
+        raise ConfigurationError(f"This application doesn't take {kind!r} proposals")
     if not isinstance(rationale, str) or not rationale.strip():
         raise ConfigurationError("A rationale is required for every proposal")
     waiting = [r for r in engine.state.list_recommendations(dag_id=dag_id, status="pending") if r.get("source") == source]
@@ -33,7 +71,7 @@ def _store(engine: "Engine", *, dag_id: str | None, kind: str, title: str, paylo
         raise ConfigurationError(f"{len(waiting)} proposals from {source!r} are waiting for {dag_id!r} already: withdraw some, or wait for a human to decide them")
     rec = {
         "id": f"rec_{uuid.uuid4().hex[:12]}",
-        "run_id": None,
+        "run_id": run_id,
         "dag_id": dag_id,
         "kind": kind,
         "title": title,
@@ -46,6 +84,8 @@ def _store(engine: "Engine", *, dag_id: str | None, kind: str, title: str, paylo
         "created_at": time.time(),
         "decided_at": None,
     }
+    if applier.check is not None:
+        applier.check(engine, rec)
     engine.state.save_recommendation(rec)
     engine._emit(Event("recommendation.created", None, dag_id, payload=rec))
     return rec
@@ -129,6 +169,23 @@ def propose_memory_update(engine: "Engine", dag_id: str, memory: dict[str, Any],
     return _store(engine, dag_id=dag_id, kind="memory", title="Memory update", payload=payload, rationale=rationale, source=source, proposed_by=proposed_by)
 
 
+def propose_definition(engine: "Engine", dag_id: str, definition: str, rationale: str, *, title: str = "A new definition", run_id: str | None = None, details: dict[str, Any] | None = None, source: str = "api", proposed_by: str | None = None) -> dict[str, Any]:
+    """Propose replacing the text a DAG was read from (:attr:`Dag.definition`) with ``definition``, whole: for an
+    application that reads DAGs from text and applies these (``engine.appliers["definition"]``). The payload keeps
+    the text it replaces as ``base``, and ``details`` besides."""
+    dag = engine._dag(dag_id)
+    if dag.definition is None:
+        raise ConfigurationError(f"DAG {dag_id!r} wasn't read from a definition the application keeps")
+    if not isinstance(definition, str) or not definition.strip():
+        raise ConfigurationError("definition must be a non-empty string")
+    if len(definition) > MAX_PROMPT:
+        raise ConfigurationError(f"definition exceeds {MAX_PROMPT} characters")
+    if " ".join(definition.split()) == " ".join(dag.definition.split()):
+        raise ConfigurationError("That's the definition already")
+    payload = {**(details or {}), "definition": definition, "base": dag.definition}
+    return _store(engine, dag_id=dag_id, kind="definition", title=title, payload=payload, rationale=rationale, source=source, proposed_by=proposed_by, run_id=run_id)
+
+
 def withdraw_proposal(engine: "Engine", rec_id: str, *, source: str | None = None, proposed_by: str | None = None, reason: str = "") -> dict[str, Any]:
     """Withdraw a pending proposal. With ``source`` set, only proposals from that source can be withdrawn, and with
     ``proposed_by`` too, only those it made."""
@@ -147,3 +204,55 @@ def withdraw_proposal(engine: "Engine", rec_id: str, *, source: str | None = Non
     engine.state.save_recommendation(rec)
     engine._emit(Event("recommendation.withdrawn", rec.get("run_id"), rec.get("dag_id"), payload=rec))
     return rec
+
+
+# -- applying the built-in kinds ---------------------------------------------------------------------------
+
+
+def _apply_tools(engine: "Engine", rec: dict[str, Any]) -> dict[str, Any]:
+    payload, dag_id = rec.get("payload") or {}, rec["dag_id"]
+    overrides = dict(engine.overrides_for(dag_id))
+    unset = set(payload.get("unset") or [])
+    for key in ("allow", "hide", "deny"):
+        current = [t for t in overrides.get(key) or [] if t not in unset]
+        for name in payload.get(key) or []:
+            if name not in current:
+                current.append(name)
+        overrides[key] = current
+    # consistency: an allowed tool is no longer denied/hidden by override and vice-versa
+    overrides["deny"] = [t for t in overrides["deny"] if t not in (payload.get("allow") or [])]
+    overrides["allow"] = [t for t in overrides["allow"] if t not in (payload.get("deny") or [])]
+    engine.set_overrides(dag_id, overrides)
+    return {"overrides": overrides}
+
+
+def _apply_skills(engine: "Engine", rec: dict[str, Any]) -> dict[str, Any]:
+    payload = rec.get("payload") or {}
+    by = "DagEvaluator" if rec.get("source") in (None, "dag_evaluator") else rec.get("proposed_by") or rec.get("source")
+    made = f" from run {rec['run_id']}" if rec.get("run_id") else ""
+    skill = engine.skills.register(payload["skill"], payload["content"], note=f"Approved proposal {rec['id']} by {by}{made}")
+    return {"skill": skill.name, "version": skill.current}
+
+
+def _apply_topology(engine: "Engine", rec: dict[str, Any]) -> dict[str, Any]:
+    payload, dag_id = rec.get("payload") or {}, rec["dag_id"]
+    overrides = dict(engine.overrides_for(dag_id))
+    prompts = dict(overrides.get("prompts") or {})
+    dag = engine.dags.get(dag_id)
+    applied, manual = [], list(payload.get("structural_changes") or [])
+    for change in payload.get("prompt_changes") or []:
+        task_id = change.get("task_id")
+        if dag is not None and task_id in dag.tasks and isinstance(getattr(dag.get(task_id), "prompt", None), str):
+            prompts[task_id] = change["proposed"]
+            applied.append(task_id)
+        else:
+            manual.append(f"prompt change for unknown/non-agentic task {task_id!r}")
+    overrides["prompts"] = prompts
+    engine.set_overrides(dag_id, overrides)
+    return {"prompts_updated": applied, "manual_follow_up": manual}
+
+
+def _apply_memory(engine: "Engine", rec: dict[str, Any]) -> dict[str, Any]:
+    memory = (rec.get("payload") or {}).get("memory") or {}
+    engine.set_memory(rec["dag_id"], memory)
+    return {"memory_keys": sorted(memory)}

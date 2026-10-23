@@ -222,6 +222,7 @@ class Dag:
         verbosity: int | None = None,
         max_tool_steps: int | None = None,
         max_active_runs: int = 1,
+        definition: str | None = None,
     ):
         if not DAG_ID_RE.match(id):
             raise DagValidationError(f"Invalid dag id {id!r}")
@@ -237,6 +238,8 @@ class Dag:
         self.description = description
         self.tags = tuple(tags)
         self.max_active_runs = max_active_runs
+        # The text the application read it from, if it keeps one (a file, say): what a "definition" proposal replaces.
+        self.definition = definition
         self.scope = ScopeConfig(
             model=model,
             thinking=thinking,
@@ -425,6 +428,7 @@ class Dag:
             "schedule": [t.to_dict() for t in self.schedule],
             "auto_evaluate": self.auto_evaluate,
             "config": self.scope.to_dict(),
+            "definition": self.definition,
             "tasks": [t.describe() for t in self.topological_order()],
             "groups": [g.to_dict() for g in self.groups if g.parent is None],
         }

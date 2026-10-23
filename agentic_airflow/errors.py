@@ -57,3 +57,7 @@ class RunError(AgenticAirflowError):
 
 class ApprovalError(AgenticAirflowError):
     """An approval / decision could not be applied."""
+
+
+class StaleProposalError(ApprovalError):
+    """An approved proposal no longer fits what it changes, say because that changed since: it's marked stale."""
