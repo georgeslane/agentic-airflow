@@ -6,7 +6,8 @@
     server.start()            # background thread; engine must be running in an event loop
 
 Routes (``Authorization: Bearer <token>`` required for everything except
-webhooks when a token is configured; pages also accept ``?token=``):
+webhooks when a token is configured; pages also accept ``?token=``, which is
+moved into a ``SameSite=Strict`` cookie and taken out of the address):
 
 * ``GET  /``                              - index of DAGs and recent runs
 * ``GET  /dags/{dag_id}[?run=<run_id>]``  - graph page (auto-refreshing)
@@ -25,6 +26,12 @@ webhooks when a token is configured; pages also accept ``?token=``):
 
 Binding to a non-loopback host without a token raises unless
 ``allow_insecure=True`` is passed explicitly.
+
+Other web pages open in the same browser can't use the server: without a token
+it only answers requests addressed to a loopback name or the host it was bound
+to (``allowed_hosts`` adds more), so a DNS-rebound name is refused; a POST from
+another origin is refused; and the API only takes JSON, which a page on another
+site can't send without the server's agreement.
 """
 
 from __future__ import annotations
@@ -37,8 +44,9 @@ import logging
 import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable
-from urllib.parse import parse_qs, urlsplit
+from http.cookies import SimpleCookie
+from typing import Any, Callable, Iterable
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from ..errors import AgenticAirflowError, WebhookAuthenticationError
 from .html import render_html
@@ -46,17 +54,20 @@ from .html import render_html
 log = logging.getLogger("agentic_airflow.ui")
 
 MAX_BODY = 2_000_000
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+COOKIE = "agentic_airflow_token"
 
 
 class UIServer:
-    def __init__(self, engine: Any, *, host: str = "127.0.0.1", port: int = 8800, token: str | None = None, allow_insecure: bool = False, refresh_ms: int = 2000):
-        if host not in ("127.0.0.1", "localhost", "::1") and not token and not allow_insecure:
+    def __init__(self, engine: Any, *, host: str = "127.0.0.1", port: int = 8800, token: str | None = None, allow_insecure: bool = False, refresh_ms: int = 2000, allowed_hosts: Iterable[str] = ()):
+        if host not in LOOPBACK and not token and not allow_insecure:
             raise AgenticAirflowError("Refusing to bind a non-loopback address without a token (pass allow_insecure=True to override)")
         self.engine = engine
         self.host = host
         self.port = port
         self.token = token
         self.refresh_ms = refresh_ms
+        self.allowed_hosts = {h.lower() for h in (*LOOPBACK, host, *allowed_hosts)}
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -100,14 +111,44 @@ class UIServer:
 
         return asyncio.run_coroutine_threadsafe(runner(), loop).result(timeout=60)
 
-    def authorised(self, headers: Any, query: dict[str, list[str]]) -> bool:
+    def authorised(self, headers: Any) -> bool:
+        """The bearer token, the X-Api-Token header or the page's cookie; anything without a token."""
         if not self.token:
             return True
         auth = headers.get("Authorization", "")
         candidate = auth[7:] if auth.lower().startswith("bearer ") else headers.get("X-Api-Token", "")
-        if not candidate and "token" in query:
-            candidate = query["token"][0]
-        return hmac.compare_digest(candidate, self.token)
+        if candidate:
+            return hmac.compare_digest(candidate.encode(), self.token.encode())
+        cookie = SimpleCookie(headers.get("Cookie", ""))
+        return COOKIE in cookie and hmac.compare_digest(cookie[COOKIE].value, self.cookie_value())
+
+    def cookie_value(self) -> str:
+        """What the pages' cookie holds: derived from the token, so the token itself isn't kept in the browser."""
+        return hmac.new((self.token or "").encode(), b"agentic-airflow page cookie", "sha256").hexdigest()
+
+    def host_allowed(self, headers: Any) -> bool:
+        """Whether a request is addressed to this server, by a name it answers to. With a token anything is: a
+        DNS-rebound page can't send the token."""
+        if self.token:
+            return True
+        return _hostname(headers.get("Host", "")) in self.allowed_hosts
+
+    @staticmethod
+    def same_origin(headers: Any) -> bool:
+        """Whether a request isn't from another site's page: browsers send an Origin with every POST, and other
+        clients send none."""
+        origin = headers.get("Origin")
+        if origin is None:
+            return True
+        return urlsplit(origin).netloc.lower() == headers.get("Host", "").lower()
+
+
+def _hostname(host: str) -> str:
+    """The name in a Host header, without its port: "[::1]:8800" -> "::1"."""
+    host = host.strip().lower()
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -119,8 +160,10 @@ class _Handler(BaseHTTPRequestHandler):
         log.debug("%s - " + fmt, self.address_string(), *args)
 
     # -- helpers -----------------------------------------------------------
-    def _send(self, status: int, body: bytes, content_type: str) -> None:
+    def _send(self, status: int, body: bytes, content_type: str, headers: dict[str, str] | None = None) -> None:
         self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -150,25 +193,38 @@ class _Handler(BaseHTTPRequestHandler):
         return segments, parse_qs(parts.query)
 
     # -- GET -----------------------------------------------------------------
+    def _with_cookie(self, query: dict[str, list[str]]) -> None:
+        """A page asked for with ?token=: keep the token in a cookie only this site's pages send, and ask for the
+        page again without it, so it isn't left in the address, the history or a log."""
+        srv = self.server_ref
+        if not srv.token or not hmac.compare_digest(query["token"][0].encode(), srv.token.encode()):
+            return self._error(401, "unauthorised")
+        rest = {k: v for k, v in query.items() if k != "token"}
+        location = urlsplit(self.path).path + (f"?{urlencode(rest, doseq=True)}" if rest else "")
+        cookie = f"{COOKIE}={srv.cookie_value()}; Path=/; HttpOnly; SameSite=Strict"
+        self._send(303, b"", "text/plain", {"Location": location, "Set-Cookie": cookie})
+
     def do_GET(self) -> None:  # noqa: N802
         srv = self.server_ref
         segments, query = self._route()
         try:
-            if not srv.authorised(self.headers, query):
+            if not srv.host_allowed(self.headers):
+                return self._error(403, "unknown host")
+            if "token" in query and segments[:1] != ["api"]:
+                return self._with_cookie(query)
+            if not srv.authorised(self.headers):
                 return self._error(401, "unauthorised")
             engine = srv.engine
-            token_q = f"?token={query['token'][0]}" if "token" in query else ""
             if not segments:
-                return self._html(self._index_page(token_q))
+                return self._html(self._index_page())
             if segments[0] == "dags" and len(segments) == 2:
                 dag_id = segments[1]
                 if dag_id not in engine.dags:
                     return self._error(404, "unknown dag")
                 run_id = query.get("run", [None])[0]
                 graph = srv.call(engine.graph, dag_id, run_id)
-                refresh = f"/api/runs/{run_id}/graph" if run_id else None
-                token = query.get("token", [None])[0]
-                return self._html(render_html(graph, refresh_url=refresh, refresh_ms=srv.refresh_ms, token=token))
+                refresh = f"/api/runs/{run_id}/graph" if run_id else None  # its cookie goes with the page's requests
+                return self._html(render_html(graph, refresh_url=refresh, refresh_ms=srv.refresh_ms))
             if segments[0] == "api":
                 return self._api_get(segments[1:], query)
             if segments[0] == "healthz":
@@ -216,8 +272,12 @@ class _Handler(BaseHTTPRequestHandler):
     # -- POST ----------------------------------------------------------------
     def do_POST(self) -> None:  # noqa: N802
         srv = self.server_ref
-        segments, query = self._route()
+        segments, _ = self._route()
         try:
+            if not srv.host_allowed(self.headers):
+                return self._error(403, "unknown host")
+            if not srv.same_origin(self.headers):
+                return self._error(403, "cross-origin request refused")
             raw = self._body()
             if segments[:1] == ["webhooks"] and len(segments) == 2:
                 signature = self.headers.get("X-Signature-256") or self.headers.get("X-Hub-Signature-256")
@@ -226,8 +286,10 @@ class _Handler(BaseHTTPRequestHandler):
                 except WebhookAuthenticationError as exc:
                     return self._error(401, str(exc))
                 return self._json({"runs": [r.run_id for r in runs]}, 202)
-            if not srv.authorised(self.headers, query):
+            if not srv.authorised(self.headers):
                 return self._error(401, "unauthorised")
+            if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json":
+                return self._error(415, "send JSON, with Content-Type: application/json")
             data = json.loads(raw.decode("utf-8")) if raw else {}
             if not isinstance(data, dict):
                 return self._error(400, "JSON object expected")
@@ -272,15 +334,15 @@ class _Handler(BaseHTTPRequestHandler):
         return self._error(404, "not found")
 
     # -- pages ---------------------------------------------------------------
-    def _index_page(self, token_q: str) -> str:
+    def _index_page(self) -> str:
         srv, engine = self.server_ref, self.server_ref.engine
         runs = srv.call(engine.list_runs, None, None, 30)
         rows = "".join(
-            f"<tr><td><a href=\"/dags/{html.escape(r.dag_id)}?run={html.escape(r.run_id)}{html.escape('&' + token_q[1:]) if token_q else ''}\">{html.escape(r.run_id)}</a></td>"
+            f"<tr><td><a href=\"/dags/{html.escape(r.dag_id)}?run={html.escape(r.run_id)}\">{html.escape(r.run_id)}</a></td>"
             f"<td>{html.escape(r.dag_id)}</td><td>{html.escape(r.status.value)}</td></tr>"
             for r in runs
         )
-        dags = "".join(f"<li><a href=\"/dags/{html.escape(d.id)}{html.escape(token_q)}\">{html.escape(d.id)}</a> <small>{html.escape(d.description or '')}</small></li>" for d in engine.dags.values())
+        dags = "".join(f"<li><a href=\"/dags/{html.escape(d.id)}\">{html.escape(d.id)}</a> <small>{html.escape(d.description or '')}</small></li>" for d in engine.dags.values())
         nonce = secrets.token_urlsafe(8)
         return (
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"

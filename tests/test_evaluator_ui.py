@@ -122,6 +122,8 @@ async def test_http_server_routes(make_engine, backend):
 
         def call(path, data=None, token="tok", headers=None):
             hdrs = {"Authorization": f"Bearer {token}"} if token else {}
+            if isinstance(data, dict):
+                hdrs["Content-Type"] = "application/json"
             hdrs.update(headers or {})
             body = json.dumps(data).encode() if isinstance(data, dict) else data
             req = urllib.request.Request(base + path, data=body, headers=hdrs, method="POST" if body is not None else "GET")
@@ -137,7 +139,7 @@ async def test_http_server_routes(make_engine, backend):
             out = {}
             out["unauth"] = call("/api/dags", token=None)[0]
             out["dags"] = json.loads(call("/api/dags")[1])
-            out["page"] = call("/dags/srv?token=tok", token=None)
+            out["page"] = call("/dags/srv", token="tok")
             out["trigger"] = json.loads(call("/api/runs", {"dag_id": "srv", "payload": {"k": 1}})[1])
             hook = dag.schedule[0]
             raw = b'{"from": "hook"}'
@@ -164,3 +166,64 @@ def test_server_refuses_insecure_bind(make_engine):
 
     with pytest.raises(AgenticAirflowError):
         UIServer(make_engine(), host="0.0.0.0", port=0)
+
+
+def _raw(server, method, path, headers=None, body=b""):
+    """A request as a browser might send it, without following redirects."""
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    conn.request(method, path, body=body or None, headers=headers or {})
+    resp = conn.getresponse()
+    out = resp.status, dict(resp.getheaders()), resp.read()
+    conn.close()
+    return out
+
+
+@pytest.mark.asyncio
+async def test_other_sites_pages_cant_use_the_server(make_engine):
+    import asyncio
+
+    from agentic_airflow.ui.server import COOKIE, UIServer
+
+    with Dag("srv", prompt="p", auto_evaluate=False) as dag:
+        Task("a", fn=lambda ctx: "x")
+    engine = make_engine()
+    engine.register(dag)
+    async with engine:
+        open_ = UIServer(engine, port=0).start()  # no token: loopback only
+        locked = UIServer(engine, port=0, token="tok").start()
+        here = f"127.0.0.1:{open_.port}"
+        body = b'{"dag_id": "srv"}'
+
+        def calls():
+            out = {}
+            post = lambda headers: _raw(open_, "POST", "/api/runs", {"Host": here, **headers}, body)[0]  # noqa: E731
+            out["json"] = post({"Content-Type": "application/json"})
+            out["same_origin"] = post({"Content-Type": "application/json", "Origin": f"http://{here}"})
+            out["other_origin"] = post({"Content-Type": "application/json", "Origin": "https://evil.example"})
+            out["text"] = post({"Content-Type": "text/plain"})  # what a form or a simple fetch sends
+            out["rebound"] = _raw(open_, "POST", "/api/runs", {"Host": "evil.example", "Content-Type": "application/json"}, body)[0]
+            out["rebound_get"] = _raw(open_, "GET", "/api/runs", {"Host": f"evil.example:{open_.port}"})[0]
+            out["localhost"] = _raw(open_, "GET", "/api/dags", {"Host": f"localhost:{open_.port}"})[0]
+            out["ipv6"] = _raw(open_, "GET", "/api/dags", {"Host": f"[::1]:{open_.port}"})[0]
+            # With a token, ?token= on a page becomes a cookie, and the address loses it.
+            status, headers, _ = _raw(locked, "GET", "/dags/srv?run=r1&token=tok")
+            out["redirect"] = status, headers.get("Location"), headers.get("Set-Cookie", "")
+            out["bad_token"] = _raw(locked, "GET", "/?token=nope")[0]
+            cookie = headers.get("Set-Cookie", "").split(";")[0]
+            out["with_cookie"] = _raw(locked, "GET", "/api/dags", {"Cookie": cookie})[0]
+            out["wrong_cookie"] = _raw(locked, "GET", "/api/dags", {"Cookie": f"{COOKIE}=tok"})[0]
+            out["api_query"] = _raw(locked, "GET", "/api/dags?token=tok")[0]  # the API takes a header, not ?token=
+            return out
+
+        out = await asyncio.get_running_loop().run_in_executor(None, calls)
+        open_.stop()
+        locked.stop()
+    assert out["json"] == 202 and out["same_origin"] == 202 and out["localhost"] == 200 and out["ipv6"] == 200
+    assert out["other_origin"] == 403 and out["text"] == 415 and out["rebound"] == 403 and out["rebound_get"] == 403
+    status, location, cookie = out["redirect"]
+    assert status == 303 and location == "/dags/srv?run=r1" and "tok" not in location
+    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie and "=tok;" not in cookie
+    assert out["bad_token"] == 401 and out["with_cookie"] == 200 and out["wrong_cookie"] == 401 and out["api_query"] == 401
+    assert len([r for r in engine.list_runs() if r.trigger.get("source") == "api"]) == 2

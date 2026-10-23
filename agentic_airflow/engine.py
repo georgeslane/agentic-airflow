@@ -36,10 +36,11 @@ from .agent_loop import _dump, run_agentic_instance
 from .config import EngineConfig, ResolvedConfig, resolve_config
 from .dag import Dag
 from .helpers import is_empty
-from .errors import ApprovalError, ConfigurationError, RunError, TriggerError
+from .errors import ApprovalError, ConfigurationError, RunError, StaleProposalError, TriggerError
 from .models import GenerationRequest, Message, ModelBackend, OutputSpec
 from .operators import NO_BRANCH, AgenticBranch, AgenticEvaluator, BaseOperator, Task
 from .priority import USER_PRIORITY, ModelQueueSet
+from .proposals import Applier, built_in_appliers
 from .run import (
     ACTIVE_STATUSES,
     RUN_TERMINAL,
@@ -86,6 +87,8 @@ class Engine:
         self.chat_sink = chat_sink
         # Shared with an application that holds the same models for its own users (see user_slot).
         self.queues = queues or ModelQueueSet(self.config.model_concurrency, self.config.default_concurrency)
+        # The kinds of proposal it takes, and how each is applied once approved (proposals.py): change it to suit.
+        self.appliers: dict[str, Applier] = built_in_appliers()
         self.cpu_pool = ThreadPoolExecutor(max_workers=self.config.cpu_workers, thread_name_prefix="agentic-airflow-cpu")
         self.dags: dict[str, Dag] = {}
         self.runs: dict[str, DagRun] = {}
@@ -1303,15 +1306,27 @@ class Engine:
         return self.state.list_recommendations(dag_id=dag_id, run_id=run_id, status=status)
 
     async def approve_recommendation(self, rec_id: str) -> dict[str, Any]:
-        """Apply a DagEvaluator recommendation (the human approval gate)."""
-        from .evaluator import apply_recommendation
-
+        """Apply a recommendation or proposal, with ``appliers[kind]`` (the human approval gate). One that no longer
+        fits is marked stale, and StaleProposalError raised."""
         rec = self.state.get_recommendation(rec_id)
         if rec is None:
             raise ApprovalError(f"Unknown recommendation {rec_id!r}")
         if rec["status"] != "pending":
             raise ApprovalError(f"Recommendation {rec_id!r} is already {rec['status']}")
-        result = apply_recommendation(self, rec)
+        applier = self.appliers.get(rec["kind"])
+        if applier is None:
+            raise ApprovalError(f"This application doesn't apply {rec['kind']!r} proposals")
+        try:
+            result = applier.apply(self, rec)
+            if inspect.isawaitable(result):
+                result = await result
+        except StaleProposalError as exc:
+            rec["status"] = "stale"
+            rec["decided_at"] = time.time()
+            rec["reason"] = str(exc)
+            self.state.save_recommendation(rec)
+            self._emit(Event("recommendation.stale", rec.get("run_id"), rec.get("dag_id"), payload=rec))
+            raise
         rec["status"] = "approved"
         rec["decided_at"] = time.time()
         rec["applied"] = result

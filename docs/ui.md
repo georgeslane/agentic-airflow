@@ -59,4 +59,10 @@ The server runs in a daemon thread and proxies calls onto the engine's event loo
 | `POST /webhooks/{name}` (`X-Signature-256: sha256=<hmac>`) | webhook delivery (202) |
 | `GET /api/stats`, `GET /healthz` | diagnostics |
 
-Authentication: when `token` is set, every route except webhooks requires `Authorization: Bearer <token>` (or `X-Api-Token`); HTML pages also accept `?token=` so they can be opened in a browser. Binding to a non-loopback address without a token raises unless `allow_insecure=True`. Responses carry `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and a CSP.
+Authentication: when `token` is set, every route except webhooks requires `Authorization: Bearer <token>` (or `X-Api-Token`). To open the pages in a browser, add `?token=` once: the server answers with a `HttpOnly`, `SameSite=Strict` cookie, derived from the token, and sends the browser to the same address without it, so the token isn't left in the address bar, the history or a log. The API doesn't take `?token=`. Binding to a non-loopback address without a token raises unless `allow_insecure=True`. Responses carry `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and a CSP.
+
+Other pages open in the same browser can't use the server:
+
+* **Without a token**, it only answers requests addressed to a loopback name (`127.0.0.1`, `localhost`, `::1`) or the host it was bound to; pass `allowed_hosts=[...]` for others. A page on another site that rebinds its own name to `127.0.0.1` is refused.
+* **A POST from another origin** (its `Origin` header isn't this server) is refused with 403, webhooks included.
+* **The API only takes JSON**, with `Content-Type: application/json` (415 otherwise), which a page on another site can't send without asking first, and the server never agrees to.

@@ -15,7 +15,8 @@ agentic_airflow/
   agent_loop.py  one agentic instance: prompt building, step loop, tool execution, checkpoints
   helpers.py     ready-made functions: trigger_items, found_nothing
   engine.py      Engine: registration, triggers, run driver, node expansion, HITL, chat, recommendations
-  evaluator.py   DagEvaluator group + recommendation application
+  evaluator.py   DagEvaluator group
+  proposals.py   human-gated proposals: making them, and applying each kind (engine.appliers)
   state.py       StateStore protocol, InMemoryStateStore, SqliteStateStore
   ui/            graph JSON + layout, self-contained HTML renderer, stdlib HTTP server
   backends/      OpenAI-compatible and Anthropic adapters
@@ -78,4 +79,4 @@ Every state change calls `state.save_run(run.to_dict())` (JSON). `state.delete_r
 
 ## DagEvaluator
 
-`engine.register()` attaches the five-task group to the leaves (`trigger_rule="all_done"`, no tools, `include_run_log=True`). Each task's `on_complete` hook turns its JSON output into `Recommendation` documents (`kind` = `topology` | `tools` | `skills`, status `pending`), applies compacted memory (when `apply_memory=True`) and stores the executive summary on the run. `engine.approve_recommendation()` applies: tool overrides (`{"allow", "hide", "deny"}` per DAG, consulted by `resolve_permissions`), new skill versions, or prompt overrides (`overrides["prompts"][task_id]`, consulted when the prompt is built). Structural changes are reported for manual follow-up because the DAG is defined in code.
+`engine.register()` attaches the five-task group to the leaves (`trigger_rule="all_done"`, no tools, `include_run_log=True`). Each task's `on_complete` hook turns its JSON output into `Recommendation` documents (`kind` = `topology` | `tools` | `skills`, status `pending`), applies compacted memory (when `apply_memory=True`) and stores the executive summary on the run. `engine.approve_recommendation()` applies each with `engine.appliers[kind]` (`proposals.py`): tool overrides (`{"allow", "hide", "deny"}` per DAG, consulted by `resolve_permissions`), new skill versions, or prompt overrides (`overrides["prompts"][task_id]`, consulted when the prompt is built). An application can replace or remove these, and add its own kinds, such as `"definition"` for DAGs read from text. Structural changes are reported for manual follow-up because the DAG is defined in code.

@@ -156,3 +156,131 @@ def test_cli_loads_engine_target(tmp_path, monkeypatch):
     assert "d" in load_engine("myapp_engine_mod:make").dags
     with pytest.raises(SystemExit):
         load_engine("myapp_engine_mod")
+
+
+@pytest.mark.asyncio
+async def test_prompts_written_when_a_task_starts(make_engine):
+    with Dag("dyn", prompt="p", auto_evaluate=False) as dag:
+        AgenticTask("written", prompt=lambda engine, run: "Written now.")
+    engine = make_engine()
+    engine.register(dag)
+    server = build_server(engine)
+    got = await call(server, "get_dag", dag_id="dyn")
+    assert got["ok"] and got["data"]["tasks"][0]["effective_prompt"] == "(written when the task starts)"
+    refused = await call(server, "propose_prompt_change", dag_id="dyn", task_id="written", proposed_prompt="x", rationale="r")
+    assert refused["ok"] is False and "writes its prompt when it starts" in refused["error"]
+
+
+@pytest.mark.asyncio
+async def test_clients_withdraw_only_their_own_and_cant_flood_the_queue(engine_with_run):
+    from agentic_airflow.proposals import MAX_PENDING
+
+    engine, _ = engine_with_run
+    mine, other = build_server(engine, client_name="mine"), build_server(engine, client_name="other")
+    made = await call(mine, "propose_structural_change", dag_id="insp", description="Add a step", rationale="r")
+    refused = await call(other, "withdraw_proposal", recommendation_id=made["data"]["id"])
+    assert refused["ok"] is False and "another client" in refused["error"]
+    assert (await call(mine, "withdraw_proposal", recommendation_id=made["data"]["id"]))["ok"]
+    for n in range(MAX_PENDING):
+        assert (await call(mine, "propose_structural_change", dag_id="insp", description=f"Step {n}", rationale="r"))["ok"]
+    flood = await call(other, "propose_structural_change", dag_id="insp", description="One more", rationale="r")
+    assert flood["ok"] is False and "waiting for 'insp' already" in flood["error"]
+
+
+@pytest.mark.asyncio
+async def test_tool_overrides_can_be_taken_back(engine_with_run):
+    engine, _ = engine_with_run
+    server = build_server(engine)
+    allowed = await call(server, "propose_tool_permissions", dag_id="insp", rationale="r", allow=["web_search"], deny=["delete_file"])
+    await engine.approve_recommendation(allowed["data"]["id"])
+    nothing = await call(server, "propose_tool_permissions", dag_id="insp", rationale="r", unset=["send_email"])
+    assert nothing["ok"] is False and "No override" in nothing["error"]
+    back = await call(server, "propose_tool_permissions", dag_id="insp", rationale="r", unset=["web_search"])
+    await engine.approve_recommendation(back["data"]["id"])
+    assert engine.overrides_for("insp")["allow"] == [] and engine.overrides_for("insp")["deny"] == ["delete_file"]
+    skill = await call(server, "propose_skill_rewrite", skill="S", content="New.", rationale="r")
+    await engine.approve_recommendation(skill["data"]["id"])
+    assert engine.skills.get("S").to_dict()["versions"][-1]["note"].startswith(f"Approved proposal {skill['data']['id']} by mcp")
+
+
+def _reads_definitions(engine, saved):
+    """An application whose DAGs are read from text: it takes whole definitions, applied by saving them, and no
+    overrides."""
+    from agentic_airflow import Applier, StaleProposalError
+    from agentic_airflow.errors import ConfigurationError
+
+    def check(engine, rec):
+        if "Dag(" not in rec["payload"]["definition"]:
+            raise ConfigurationError("That isn't a DAG file: line 1")
+
+    async def apply(engine, rec):
+        dag = engine.dags[rec["dag_id"]]
+        if rec["payload"]["base"] != dag.definition:
+            raise StaleProposalError("The DAG has changed since")
+        saved.append(rec["payload"]["definition"])
+        dag.definition = rec["payload"]["definition"]
+        return {"saved": True}
+
+    engine.appliers["definition"] = Applier(apply, check)
+    for kind in ("topology", "tools", "memory"):
+        del engine.appliers[kind]
+
+
+@pytest.mark.asyncio
+async def test_an_application_applies_whole_definitions(make_engine):
+    from agentic_airflow import ApprovalError, StaleProposalError
+    from agentic_airflow.errors import ConfigurationError
+    from agentic_airflow.proposals import propose_definition, propose_prompt_change
+
+    text = "with Dag('filed', prompt='p'):\n    AgenticTask('a', prompt='x')\n"
+    with Dag("filed", prompt="p", auto_evaluate=False, definition=text) as dag:
+        AgenticTask("a", prompt="x")
+    engine = make_engine()
+    engine.register(dag)
+
+    # An engine takes no definitions unless its application says how to apply them.
+    with pytest.raises(ConfigurationError, match="doesn't take 'definition'"):
+        propose_definition(engine, "filed", text + "# more\n", "r")
+    old = propose_prompt_change(engine, "filed", "a", "y", "r")  # made while it took them
+
+    saved = []
+    _reads_definitions(engine, saved)
+    server = build_server(engine, client_name="claude-code")
+    tools = {t.name for t in await server.list_tools()}
+    assert "propose_definition" in tools and "propose_skill_rewrite" in tools
+    assert not {"propose_prompt_change", "propose_tool_permissions", "propose_memory_update"} & tools
+    assert (await call(server, "get_dag", dag_id="filed"))["data"]["definition"] == text
+
+    bad = await call(server, "propose_definition", dag_id="filed", definition="print('hi')", rationale="r")
+    assert bad["ok"] is False and "isn't a DAG file" in bad["error"]
+    same = await call(server, "propose_definition", dag_id="filed", definition=text.replace("\n", " \n"), rationale="r")
+    assert same["ok"] is False and "already" in same["error"]
+    with pytest.raises(ConfigurationError, match="doesn't take 'topology'"):
+        propose_prompt_change(engine, "filed", "a", "y", "r")
+    with pytest.raises(ApprovalError, match="doesn't apply 'topology'"):
+        await engine.approve_recommendation(old["id"])
+
+    new = text + "    AgenticTask('b', prompt='y')\n"
+    first = await call(server, "propose_definition", dag_id="filed", definition=new, rationale="Add b")
+    second = propose_definition(engine, "filed", new + "# and\n", "r", title="Tools", run_id="run_1", details={"what": "tools"})
+    assert first["ok"] and first["data"]["payload"]["base"] == text and first["data"]["kind"] == "definition"
+    assert second["run_id"] == "run_1" and second["payload"]["what"] == "tools" and second["title"] == "Tools"
+    approved = await engine.approve_recommendation(first["data"]["id"])
+    assert approved["status"] == "approved" and approved["applied"] == {"saved": True} and saved == [new]
+
+    # The other was proposed against the DAG as it was: it's stale now, and said so.
+    with pytest.raises(StaleProposalError):
+        await engine.approve_recommendation(second["id"])
+    assert engine.state.get_recommendation(second["id"])["status"] == "stale"
+    engine.state.delete_recommendation(second["id"])
+    assert engine.state.get_recommendation(second["id"]) is None
+
+
+def test_recommendations_can_be_deleted_from_sqlite(tmp_path):
+    from agentic_airflow import SqliteStateStore
+
+    store = SqliteStateStore(tmp_path / "s.db")
+    store.save_recommendation({"id": "rec_1", "dag_id": "d", "run_id": None, "status": "pending"})
+    store.delete_recommendation("rec_1")
+    assert store.get_recommendation("rec_1") is None and store.list_recommendations() == []
+    store.close()
