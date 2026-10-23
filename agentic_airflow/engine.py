@@ -8,10 +8,14 @@ Typical usage::
         run = await engine.run("my_dag")          # or engine.trigger(...) + wait()
         print(run.status, run.outputs())
 
-The engine is single-process and asyncio based. Agentic tasks go through
-per-model priority queues (one inference step at a time), deterministic
-``Task``/``Branch`` callables run on a thread pool, and every state change is
-persisted through the configured :class:`~agentic_airflow.state.StateStore`.
+The engine is single-process and asyncio based. Runs wait in a first-come,
+first-served queue, at most ``max_active_runs_per_model`` at once for the same
+model. Agentic tasks go through per-model priority queues, holding the model
+for a whole task (or one inference step: ``EngineConfig.atomic``), so live
+user requests (:meth:`Engine.user_slot`, :meth:`Engine.chat`) go between
+tasks, before any waiting DAG work. Deterministic ``Task``/``Branch``
+callables run on a thread pool, and every state change is persisted through
+the configured :class:`~agentic_airflow.state.StateStore`.
 """
 
 from __future__ import annotations
@@ -31,12 +35,14 @@ from typing import Any, Callable, Iterable
 from .agent_loop import _dump, run_agentic_instance
 from .config import EngineConfig, ResolvedConfig, resolve_config
 from .dag import Dag
+from .helpers import is_empty
 from .errors import ApprovalError, ConfigurationError, RunError, TriggerError
 from .models import GenerationRequest, Message, ModelBackend, OutputSpec
-from .operators import AgenticEvaluator, BaseOperator, Task
+from .operators import NO_BRANCH, AgenticBranch, AgenticEvaluator, BaseOperator, Task
 from .priority import USER_PRIORITY, ModelQueueSet
 from .run import (
     ACTIVE_STATUSES,
+    RUN_TERMINAL,
     Approval,
     DagRun,
     Event,
@@ -50,11 +56,12 @@ from .run import (
 from .skills import SkillStore
 from .state import InMemoryStateStore, StateStore
 from .tools import ToolRegistry, resolve_permissions
-from .triggers import CronTrigger, DagTrigger, WebhookTrigger
+from .triggers import AssetTrigger, CronTrigger, DagTrigger, WebhookTrigger
 
 log = logging.getLogger("agentic_airflow")
 
 EventCallback = Callable[[Event], Any]
+PAUSED_KEY = "paused_dags"  # meta document: {"dag_ids": [...]}
 
 
 class Engine:
@@ -80,7 +87,10 @@ class Engine:
         self.cpu_pool = ThreadPoolExecutor(max_workers=self.config.cpu_workers, thread_name_prefix="agentic-airflow-cpu")
         self.dags: dict[str, Dag] = {}
         self.runs: dict[str, DagRun] = {}
-        self._orders: dict[str, list[BaseOperator]] = {}
+        """Runs that haven't finished; finished ones are read back from the state store."""
+        self._run_dags: dict[str, Dag] = {}  # each started run's DAG, as it was when it started
+        self._background: set[asyncio.Task] = set()
+        self._paused: set[str] = set((self.state.get_meta(PAUSED_KEY) or {}).get("dag_ids") or [])
         self._drivers: dict[str, asyncio.Task] = {}
         self._instance_tasks: dict[str, dict[str, asyncio.Task]] = {}
         self._wakers: dict[str, asyncio.Event] = {}
@@ -91,6 +101,7 @@ class Engine:
         self._subscribers: list[EventCallback] = []
         self._overrides_cache: dict[str, dict[str, Any]] = {}
         self._cron_task: asyncio.Task | None = None
+        self._tick = asyncio.Event()  # wakes the scheduler loop: a DAG was registered or an approval created
         self._cron_next: dict[tuple[str, int], datetime] = {}
         self._started = False
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -100,13 +111,17 @@ class Engine:
     # ------------------------------------------------------------------
     # Registration & lifecycle
     # ------------------------------------------------------------------
-    def register(self, dag: Dag, *, evaluator: Any | None = None) -> Dag:
+    def register(self, dag: Dag, *, evaluator: Any | None = None, replace: bool = False) -> Dag:
         """Validate and register a DAG (attaching the DagEvaluator if enabled).
 
         ``evaluator`` may be a pre-built :class:`~agentic_airflow.dag.TaskGroup`
         from :func:`agentic_airflow.evaluator.DagEvaluator` to customise it.
+        ``replace=True`` swaps in a new definition for a registered id: runs
+        already going keep the definition they started with, and runs still
+        waiting to start use the new one.
         """
-        if dag.id in self.dags and self.dags[dag.id] is not dag:
+        current = self.dags.get(dag.id)
+        if current is not None and current is not dag and not replace:
             raise ConfigurationError(f"A different DAG with id {dag.id!r} is already registered")
         dag.validate()
         if dag.auto_evaluate and dag.evaluator_group is None:
@@ -117,20 +132,49 @@ class Engine:
 
                 attach_dag_evaluator(dag, evaluator or DagEvaluator())
                 dag.validate()
+        outlets = set(dag.outlets())
         for trig in dag.schedule:
             if isinstance(trig, DagTrigger) and trig.dag_id == dag.id:
                 raise TriggerError(f"DAG {dag.id!r} cannot trigger itself")
+            if isinstance(trig, AssetTrigger) and trig.name in outlets:
+                raise TriggerError(f"DAG {dag.id!r} cannot trigger itself: one of its tasks updates {trig.name!r}")
+        for key in [k for k in self._cron_next if k[0] == dag.id]:
+            self._cron_next.pop(key, None)
         self.dags[dag.id] = dag
-        self._orders[dag.id] = dag.topological_order()
         if self._started:
             self._schedule_crons(dag)
+            self._tick.set()
         return dag
 
     def unregister(self, dag_id: str) -> None:
+        """Forget a DAG. Runs going carry on; runs still waiting to start are cancelled."""
         self.dags.pop(dag_id, None)
-        self._orders.pop(dag_id, None)
         for key in [k for k in self._cron_next if k[0] == dag_id]:
             self._cron_next.pop(key, None)
+        for run in list(self.runs.values()):
+            if run.dag_id == dag_id and run.status == RunStatus.PENDING and run.run_id not in self._drivers:
+                run.error = "Its DAG was unregistered before it started."
+                self._finalize(run, RunStatus.CANCELLED)
+
+    # -- pausing --------------------------------------------------------------
+    def pause(self, dag_id: str) -> None:
+        """Stop a DAG's schedule, webhooks, assets and other DAGs from starting it; only :meth:`trigger` with
+        ``source="manual"`` (the default) still does. Runs waiting to start that weren't manual are cancelled."""
+        self._dag(dag_id)
+        self._paused.add(dag_id)
+        self.state.set_meta(PAUSED_KEY, {"dag_ids": sorted(self._paused)})
+        for run in list(self.runs.values()):
+            waiting = run.status == RunStatus.PENDING and run.run_id not in self._drivers
+            if run.dag_id == dag_id and waiting and run.trigger.get("source") != "manual":
+                run.error = "Its DAG was paused before it started."
+                self._finalize(run, RunStatus.CANCELLED)
+
+    def unpause(self, dag_id: str) -> None:
+        self._paused.discard(dag_id)
+        self.state.set_meta(PAUSED_KEY, {"dag_ids": sorted(self._paused)})
+
+    def is_paused(self, dag_id: str) -> bool:
+        return dag_id in self._paused
 
     async def start(self) -> None:
         """Start background scheduling (cron). Idempotent."""
@@ -179,6 +223,16 @@ class Engine:
 
     def close(self) -> None:
         self.cpu_pool.shutdown(wait=False)
+
+    def user_slot(self, model: str) -> Any:
+        """An async context manager holding ``model`` for a live user request: it waits for the task (or step)
+        using the model to finish, then goes before any DAG work that's waiting, after earlier user requests."""
+        return self.queues.get(model).slot(USER_PRIORITY, 0.0)
+
+    def _spawn(self, coro: Any) -> None:
+        task = asyncio.ensure_future(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     async def _ensure_started(self) -> None:
         if not self._started:
@@ -239,7 +293,7 @@ class Engine:
         self._attach_run(run)
         self._persist(run)
         self._emit(Event("run.created", run.run_id, dag_id, payload={"trigger": run.trigger}))
-        self._start_queued_runs(dag_id)
+        self._start_queued_runs()
         return run
 
     async def run(self, dag_id: str, payload: Any = None, *, timeout: float | None = None, stop_on_pause: bool = True) -> DagRun:
@@ -301,7 +355,7 @@ class Engine:
         if run_id not in self._wakers:
             self._attach_run(run)
         run.status = RunStatus.PENDING  # re-queued; the driver flips it to RUNNING/PAUSED
-        self._start_queued_runs(run.dag_id)
+        self._start_queued_runs()
         return run
 
     async def resume_interrupted(self) -> list[DagRun]:
@@ -319,7 +373,8 @@ class Engine:
             if data is None:
                 raise RunError(f"Unknown run {run_id!r}")
             run = DagRun.from_dict(data)
-            self.runs[run_id] = run
+            if not run.is_terminal:
+                self.runs[run_id] = run
         return run
 
     def list_runs(self, dag_id: str | None = None, status: str | Iterable[str] | None = None, limit: int = 50) -> list[DagRun]:
@@ -364,17 +419,42 @@ class Engine:
                         trig = dag.schedule[idx]
                         assert isinstance(trig, CronTrigger)
                         self._cron_next[key] = trig.next_fire(now)
+                        if self.is_paused(dag_id):
+                            continue
+                        if any(r.dag_id == dag_id and r.status == RunStatus.PENDING for r in self.runs.values()):
+                            log.info("DAG %s is still waiting to start a run: not queueing another for %s", dag_id, when)
+                            continue
                         await self.trigger(dag_id, None, source="cron", extra={"cron": trig.expression, "scheduled_for": when.isoformat()})
-                upcoming = [w for w in self._cron_next.values()]
-                delay = 30.0
-                if upcoming:
-                    delay = max(0.5, min(30.0, (min(upcoming) - datetime.now(timezone.utc)).total_seconds()))
-                await asyncio.sleep(delay)
+                await self._expire_approvals()
+                upcoming = [(w - datetime.now(timezone.utc)).total_seconds() for w in self._cron_next.values()]
+                if self.config.approval_timeout is not None:
+                    upcoming += [a.created_at + self.config.approval_timeout - time.time() for a in self._approvals.values()]
+                delay = max(0.05, min([30.0, *upcoming]))
+                self._tick.clear()
+                try:
+                    await asyncio.wait_for(self._tick.wait(), delay)
+                except asyncio.TimeoutError:
+                    pass
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
                 log.exception("cron loop error")
                 await asyncio.sleep(5)
+
+    async def _expire_approvals(self) -> None:
+        """Resolve approvals pending for longer than ``approval_timeout``: reject a tool call, fail an evaluator."""
+        timeout = self.config.approval_timeout
+        if timeout is None:
+            return
+        for approval in list(self._approvals.values()):
+            if approval.status != "pending" or time.time() - approval.created_at < timeout:
+                continue
+            decision = "reject" if approval.kind == "tool_call" else "fail"
+            try:
+                await self.decide(approval.approval_id, decision, reason=f"No answer within {timeout:g} seconds.")
+            except Exception:  # noqa: BLE001
+                log.exception("couldn't expire approval %s", approval.approval_id)
+                self._approvals.pop(approval.approval_id, None)
 
     def webhook_names(self) -> dict[str, list[str]]:
         names: dict[str, list[str]] = {}
@@ -414,12 +494,33 @@ class Engine:
                 payload = raw_body.decode("utf-8", "replace")
         runs = []
         for dag, trig in targets:
-            runs.append(await self.trigger(dag.id, payload, source="webhook", extra={"webhook": trig.name}))
+            if not self.is_paused(dag.id):
+                runs.append(await self.trigger(dag.id, payload, source="webhook", extra={"webhook": trig.name}))
+        return runs
+
+    async def update_asset(
+        self, name: str, payload: Any = None, *, chain: Iterable[str] = (), extra: dict[str, Any] | None = None
+    ) -> list[DagRun]:
+        """Record an update of the asset ``name``: the DAGs scheduled on it run with ``payload``. ``chain`` is the
+        DAGs whose runs led to the update, which it never starts again, so DAGs can't trigger each other in a
+        circle. Returns the runs it started."""
+        chain = list(chain)
+        runs = []
+        for dag in list(self.dags.values()):
+            if self.is_paused(dag.id) or dag.id in chain:
+                continue
+            if any(isinstance(t, AssetTrigger) and t.name == name for t in dag.schedule):
+                info = {"asset": name, "chain": chain, **(extra or {})}
+                runs.append(await self.trigger(dag.id, payload, source="asset", extra=info))
+        self._emit(Event("asset.updated", None, None, payload={"asset": name, "runs": [r.run_id for r in runs]}))
         return runs
 
     def _fire_dag_triggers(self, finished: DagRun) -> None:
         status = finished.status.value
+        chain = [*(finished.trigger.get("chain") or []), finished.dag_id]
         for dag in self.dags.values():
+            if self.is_paused(dag.id) or dag.id in chain:
+                continue
             for trig in dag.schedule:
                 if isinstance(trig, DagTrigger) and trig.dag_id == finished.dag_id and status in trig.on:
                     payload = {
@@ -428,7 +529,8 @@ class Engine:
                         "status": status,
                         "outputs": finished.outputs(),
                     }
-                    asyncio.ensure_future(self.trigger(dag.id, payload, source="dag", extra={"upstream_dag": finished.dag_id}))
+                    extra = {"upstream_dag": finished.dag_id, "chain": chain}
+                    self._spawn(self.trigger(dag.id, payload, source="dag", extra=extra))
 
     # ------------------------------------------------------------------
     # Run driver
@@ -438,6 +540,14 @@ class Engine:
             return self.dags[dag_id]
         except KeyError:
             raise RunError(f"Unknown DAG {dag_id!r}") from None
+
+    def dag_for(self, run: DagRun) -> Dag:
+        """The DAG a run runs: as it was when the run started, or as it is now, if it hasn't."""
+        return self._run_dags.get(run.run_id) or self._dag(run.dag_id)
+
+    def _model_of(self, run: DagRun) -> str | None:
+        dag = self._run_dags.get(run.run_id) or self.dags.get(run.dag_id)
+        return resolve_config([self.config, dag.scope]).model if dag is not None else None
 
     def _initial_memory(self, dag: Dag) -> dict[str, Any]:
         persisted = self.state.get_memory(dag.id)
@@ -454,21 +564,29 @@ class Engine:
         self._done.setdefault(run.run_id, asyncio.Event())
         self._instance_tasks.setdefault(run.run_id, {})
 
-    def _active_run_count(self, dag_id: str) -> int:
-        return sum(1 for r in self.runs.values() if r.dag_id == dag_id and r.status in (RunStatus.RUNNING, RunStatus.PAUSED))
+    def _active(self) -> list[DagRun]:
+        return [r for r in self.runs.values() if r.status in (RunStatus.RUNNING, RunStatus.PAUSED)]
 
-    def _start_queued_runs(self, dag_id: str) -> None:
-        dag = self.dags.get(dag_id)
-        if dag is None:
-            return
+    def _start_queued_runs(self) -> None:
+        """Start waiting runs, first come first served, as far as each DAG's ``max_active_runs`` and the engine's
+        ``max_active_runs_per_model`` allow. A paused run keeps its place."""
         pending = sorted(
-            (r for r in self.runs.values() if r.dag_id == dag_id and r.status == RunStatus.PENDING and r.run_id not in self._drivers),
+            (r for r in self.runs.values() if r.status == RunStatus.PENDING and r.run_id not in self._drivers),
             key=lambda r: r.created_at,
         )
+        limit = self.config.max_active_runs_per_model
         for run in pending:
-            if self._active_run_count(dag_id) >= dag.max_active_runs:
-                break
+            dag = self._run_dags.get(run.run_id) or self.dags.get(run.dag_id)
+            if dag is None:
+                continue  # unregistered: unregister() cancels it
+            active = self._active()
+            if sum(1 for r in active if r.dag_id == run.dag_id) >= dag.max_active_runs:
+                continue
+            model = self._model_of(run)
+            if limit is not None and model is not None and sum(1 for r in active if self._model_of(r) == model) >= limit:
+                continue
             run.status = RunStatus.RUNNING
+            self._run_dags[run.run_id] = dag
             self._drivers[run.run_id] = asyncio.create_task(self._drive(run), name=f"agentic-airflow-run-{run.run_id}")
 
     def _wake(self, run_id: str) -> None:
@@ -490,7 +608,7 @@ class Engine:
         return run.run_id in self._cancel_requested
 
     async def _drive(self, run: DagRun) -> None:
-        dag = self._dag(run.dag_id)
+        dag = self.dag_for(run)
         waker = self._wakers[run.run_id]
         run.status = RunStatus.RUNNING
         run.started_at = run.started_at or time.time()
@@ -499,9 +617,14 @@ class Engine:
         final = RunStatus.FAILED
         detached = False
         try:
+            gone = [t for t in run.node_instances if t not in dag.tasks]
+            if gone:  # resumed after the DAG changed: its instances no longer fit it
+                run.error = f"The DAG changed since this run started: it no longer has {gone}"
+                return
             while True:
                 self._expand_ready_nodes(run, dag)
                 self._launch_ready_instances(run, dag)
+                await self._finish_nodes(run, dag)
                 if self._all_done(run, dag):
                     final = self._compute_final_status(run)
                     break
@@ -572,9 +695,24 @@ class Engine:
         done = self._done.get(run.run_id)
         if done is not None:
             done.set()
+        self._wakers.pop(run.run_id, None)
+        self._done.pop(run.run_id, None)
+        self._run_dags.pop(run.run_id, None)
+        self.runs.pop(run.run_id, None)  # read back from the state store when asked for
+        if self.config.keep_runs is not None:
+            self._prune(run.dag_id, self.config.keep_runs)
         if self._started and self.loop is not None and self.loop.is_running():
             self._fire_dag_triggers(run)
-            self._start_queued_runs(run.dag_id)
+            self._start_queued_runs()
+
+    def _prune(self, dag_id: str, keep: int) -> None:
+        """Delete the finished runs of a DAG beyond the newest ``keep``."""
+        try:
+            finished = self.state.list_runs(dag_id=dag_id, status=[s.value for s in RUN_TERMINAL], limit=keep + 1000)
+            for data in finished[keep:]:
+                self.state.delete_run(data["run_id"])
+        except Exception:  # noqa: BLE001
+            log.exception("couldn't delete old runs of %s", dag_id)
 
     def _compute_final_status(self, run: DagRun) -> RunStatus:
         if any(i.status in (TaskStatus.FAILED, TaskStatus.UPSTREAM_FAILED) for i in run.instances.values()):
@@ -589,7 +727,7 @@ class Engine:
     # ------------------------------------------------------------------
     def _expand_ready_nodes(self, run: DagRun, dag: Dag) -> None:
         expanded = set(run.expanded)
-        for node in self._orders[dag.id]:
+        for node in dag.topological_order():
             if node.id in expanded:
                 continue
             if not all(u.id in expanded for u in node.upstream):
@@ -616,6 +754,15 @@ class Engine:
             if failed:
                 placeholder(TaskStatus.UPSTREAM_FAILED, f"upstream failed: {failed[0].instance_id}")
                 return
+        if node.skip_if is not None:
+            try:
+                why = node.skip_if(self, run)
+            except Exception:  # noqa: BLE001 - a broken check shouldn't skip work
+                log.exception("skip_if of %s failed", node.id)
+                why = None
+            if why:
+                placeholder(TaskStatus.SKIPPED, str(why))
+                return
 
         def pick(insts: list[TaskInstance], path: tuple[int, ...]) -> TaskInstance | None:
             best = None
@@ -637,7 +784,9 @@ class Engine:
                 if ui.status != TaskStatus.SUCCESS:
                     continue
                 if isinstance(ui.output, list):
-                    for j in range(len(ui.output)):
+                    if len(ui.output) > self.config.max_mapped:
+                        log.warning("%s returned %d items: mapping the first %d", ui.instance_id, len(ui.output), self.config.max_mapped)
+                    for j in range(min(len(ui.output), self.config.max_mapped)):
                         lanes.append((ui.map_path + (j,), {src.id: ("item", ui.instance_id, j)}, [ui.instance_id]))
                 else:
                     lanes.append((ui.map_path, {src.id: ("output", ui.instance_id)}, [ui.instance_id]))
@@ -705,6 +854,29 @@ class Engine:
                 inst.finished_at = time.time()
             self._register_instance(run, node, inst)
 
+    async def _finish_nodes(self, run: DagRun, dag: Dag) -> None:
+        """For each node whose instances have all finished: emit ``node.finished``, and update its outlets' assets
+        with what it produced, if it produced anything."""
+        for node_id in run.expanded:
+            if node_id in run.done_nodes:
+                continue
+            insts = run.instances_for(node_id)
+            if not all(i.is_terminal for i in insts):
+                continue
+            run.done_nodes.append(node_id)
+            node = dag.get(node_id)
+            self._emit(Event("node.finished", run.run_id, run.dag_id, node_id, payload={"statuses": {i.instance_id: i.status.value for i in insts}}))
+            if not node.outlets:
+                continue
+            produced = node_output(node, insts)
+            if produced is None:
+                continue
+            chain = [*(run.trigger.get("chain") or []), run.dag_id]
+            extra = {"from_dag": run.dag_id, "from_task": node_id, "from_run": run.run_id}
+            for name in node.outlets:
+                await self.update_asset(name, produced, chain=chain, extra=extra)
+            self._persist(run)
+
     def _register_instance(self, run: DagRun, node: BaseOperator, inst: TaskInstance) -> None:
         if inst.instance_id in run.instances:
             raise RunError(f"Duplicate instance id {inst.instance_id!r}")
@@ -746,15 +918,17 @@ class Engine:
                 upstream[key] = src[binding[2]] if isinstance(src, list) and binding[2] < len(src) else None
             elif kind == "fanin":
                 upstream[key] = {iid: run.instances[iid].output for iid in binding[1] if iid in run.instances}
+        # A mapped instance works on its item: the whole trigger payload isn't repeated in each.
+        trigger = run.trigger if not inst.map_path else {k: v for k, v in run.trigger.items() if k != "payload"}
         return {
             "memory": run.memory,
-            "trigger": run.trigger,
+            "trigger": trigger,
             "upstream": upstream,
             "retry_history": list(inst.retry_history),
         }
 
     async def _run_instance(self, run: DagRun, inst: TaskInstance, op: BaseOperator) -> None:
-        dag = self._dag(run.dag_id)
+        dag = self.dag_for(run)
         cfg = resolve_config([self.config, *dag.scopes_for(op)])
         inst.status = TaskStatus.RUNNING
         inst.started_at = inst.started_at or time.time()
@@ -779,7 +953,7 @@ class Engine:
                 if state in ("rerun", "paused"):
                     return
                 value = inst.output
-            self._complete(run, inst, op, cfg, value)
+            await self._complete(run, inst, op, cfg, value)
         except asyncio.CancelledError:
             if run.run_id not in self._detaching:
                 inst.status = TaskStatus.FAILED
@@ -798,15 +972,20 @@ class Engine:
             self._persist(run)
             self._wake(run.run_id)
 
-    def _complete(self, run: DagRun, inst: TaskInstance, op: BaseOperator, cfg: ResolvedConfig, value: Any) -> None:
+    async def _complete(self, run: DagRun, inst: TaskInstance, op: BaseOperator, cfg: ResolvedConfig, value: Any) -> None:
         inst.output = value
+        if op.on_complete is not None:  # before the instance counts as done, so what it changes is persisted
+            try:
+                result = op.on_complete(self, run, inst)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:  # noqa: BLE001
+                log.exception("on_complete of %s failed", inst.instance_id)
         inst.status = TaskStatus.SUCCESS
         inst.finished_at = time.time()
         inst.checkpoint = None
         self._log(run, inst)
         self._chat_event(cfg, 1, Event("task.finished", run.run_id, run.dag_id, op.id, inst.instance_id, {"status": "success", "selected": inst.selected}))
-        if op.on_complete is not None:
-            self._call_callback(op.on_complete, self, run, inst)
 
     def _log(self, run: DagRun, inst: TaskInstance) -> None:
         run.log.append(RunLogEntry(
@@ -843,6 +1022,11 @@ class Engine:
     @staticmethod
     def _resolve_branch_selection(op: BaseOperator, value: Any) -> list[str]:
         ds = op.downstream_ids
+        if isinstance(op, AgenticBranch) and op.allow_none:
+            if value == NO_BRANCH:
+                return []
+            if isinstance(value, (list, tuple, set)):
+                value = [v for v in value if v != NO_BRANCH]
         if isinstance(value, bool):
             if len(ds) != 2:
                 raise RunError(f"Branch {op.id!r} returned a bool but has {len(ds)} downstream tasks (need exactly 2: [true_task, false_task])")
@@ -912,6 +1096,7 @@ class Engine:
             kind=kind, payload=payload,
         )
         self._approvals[approval.approval_id] = approval
+        self._tick.set()  # so it expires on time
         inst.approval_id = approval.approval_id
         self.state.save_approval(approval.to_dict())
         self._emit(Event("approval.requested", run.run_id, run.dag_id, op.id, inst.instance_id, approval.to_dict()))
@@ -962,7 +1147,7 @@ class Engine:
         if run.is_terminal:
             raise ApprovalError(f"Run {run.run_id!r} already finished ({run.status.value})")
         inst = run.instances[approval.instance_id]
-        dag = self._dag(run.dag_id)
+        dag = self.dag_for(run)
         op = dag.get(inst.task_id)
         decision = decision.lower()
         if approval.kind == "tool_call":
@@ -991,7 +1176,7 @@ class Engine:
             if decision == "pass":
                 inst.approval_id = None
                 inst.reason = "accepted by user after max_retries"
-                self._complete(run, inst, op, cfg, target.output)
+                await self._complete(run, inst, op, cfg, target.output)
             elif decision == "fail":
                 inst.status = TaskStatus.FAILED
                 inst.error = f"rejected by user after max_retries: {extra.get('reason') or ''}".strip()
@@ -999,7 +1184,8 @@ class Engine:
                 self._log(run, inst)
             else:
                 target.extra_retries += 1
-                target.retry_history.append({"attempt": target.attempt, "output": target.output, "reason": str(extra.get("reason") or inst.verdict.get("reason") if inst.verdict else "")})
+                reason = extra.get("reason") or (inst.verdict or {}).get("reason") or ""
+                target.retry_history.append({"attempt": target.attempt, "output": target.output, "reason": str(reason)})
                 target.attempt += 1
                 target.reset_for_retry()
                 inst.attempt += 1
@@ -1069,7 +1255,7 @@ class Engine:
         return answer
 
     def _recent_runs(self, limit: int) -> list[DagRun]:
-        runs = sorted(self.runs.values(), key=lambda r: (not r.is_terminal, r.created_at), reverse=True)
+        runs = sorted(self.list_runs(limit=limit), key=lambda r: (not r.is_terminal, r.created_at), reverse=True)
         return runs[:limit]
 
     # ------------------------------------------------------------------
@@ -1135,8 +1321,8 @@ class Engine:
         """JSON graph (nodes, edges, layout, statuses) for the UI or any front-end."""
         from .ui.graph import build_graph
 
-        dag = self._dag(dag_id)
         run = self.get_run(run_id) if run_id else None
+        dag = self.dag_for(run) if run is not None and run.run_id in self._run_dags else self._dag(dag_id)
         return build_graph(dag, run)
 
     def resolved_config(self, dag_id: str, task_id: str) -> dict[str, Any]:
@@ -1156,3 +1342,21 @@ class Engine:
             "pending_approvals": len([a for a in self._approvals.values() if a.status == "pending"]),
             "next_cron_fires": self.next_cron_fires(),
         }
+
+
+def node_output(node: BaseOperator, insts: list[TaskInstance]) -> Any:
+    """What a finished node produced, for its outlets: its output, or for a mapped node the list of its instances'
+    outputs (lists joined into one). ``None`` if it produced nothing: no successful instance, or only empty
+    outputs."""
+    ok = sorted((i for i in insts if i.status == TaskStatus.SUCCESS), key=lambda i: i.map_path)
+    values = [i.output for i in ok if not is_empty(i.output)]
+    if not values:
+        return None
+    if not any(i.map_path for i in ok):
+        return values[0]
+    joined: list[Any] = []
+    for value in values:
+        joined.extend(value if isinstance(value, list) else [value])
+    return joined
+
+

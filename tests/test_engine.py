@@ -437,7 +437,7 @@ async def test_chat_preempts_between_steps(make_engine, backend):
     backend.add(None, chat)
     with Dag("pre", prompt="p", auto_evaluate=False) as dag:
         AgenticTask("agent", prompt="x")
-    engine = make_engine()
+    engine = make_engine(config=EngineConfig(model="test-model", atomic="step"))
     engine.register(dag)
     async with engine:
         run = await engine.trigger("pre")
@@ -449,6 +449,44 @@ async def test_chat_preempts_between_steps(make_engine, backend):
     assert order.index(("chat", 0)) < order.index(("dag", 3))  # answered before the DAG finished
     assert run.chat_log[0]["answer"] == "answer"
     assert engine.queues.get("test-model").stats()["completed_steps"] == 4
+
+
+@pytest.mark.asyncio
+async def test_chat_waits_for_the_running_task_then_goes_before_the_next(make_engine, backend):
+    order = []
+    started = asyncio.Event()
+
+    async def first_step(req):
+        order.append(("first", req.metadata["step"]))
+        started.set()
+        await asyncio.sleep(0.05)
+        if req.metadata["step"] < 3:
+            return GenerationResponse(tool_calls=[ToolCall(name="send_email", arguments={"to": "a", "body": "b"})])
+        return "done"
+
+    def second(req):
+        order.append(("second", req.metadata["step"]))
+        return "done"
+
+    def chat(req):
+        order.append(("chat", req.metadata["priority"]))
+        return "answer"
+
+    backend.add("first", first_step, first_step, first_step)
+    backend.add("second", second)
+    backend.add(None, chat)
+    with Dag("atomic", prompt="p", auto_evaluate=False) as dag:
+        AgenticTask("first", prompt="x", allowed_tools=["send_email"]) >> AgenticTask("second", prompt="y")
+    engine = make_engine()
+    engine.register(dag)
+    async with engine:
+        run = await engine.trigger("atomic")
+        await started.wait()
+        answer = await engine.chat("what is happening?", run_id=run.run_id)
+        run = await engine.wait(run.run_id, timeout=5)
+    assert answer == "answer" and run.status == RunStatus.SUCCESS
+    # The running task kept the model through all three of its steps; the chat went before the next task.
+    assert order == [("first", 1), ("first", 2), ("first", 3), ("chat", 0), ("second", 1)]
 
 
 @pytest.mark.asyncio
@@ -625,5 +663,5 @@ async def test_resolved_config_and_stats(make_engine):
     engine.register(dag)
     data = engine.resolved_config("cfg", "t")
     assert data["model"] == "test-model" and data["thinking"] is True and data["skills"] == ["A"]
-    assert data["tools"] == {"allowed": [], "hidden": ["send_email", "web_search"], "denied": ["delete_file"]}
+    assert data["tools"] == {"allowed": [], "gated": [], "hidden": ["send_email", "web_search"], "denied": ["delete_file"]}
     assert engine.stats()["dags"] == ["cfg"]

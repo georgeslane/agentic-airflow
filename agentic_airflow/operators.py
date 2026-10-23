@@ -21,11 +21,13 @@ from . import _context
 from .config import ScopeConfig, Thinking
 from .errors import ConfigurationError, DagValidationError
 from .models import OutputSpec
+from .triggers import outlet_names
 
 TASK_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
 TriggerRule = Literal["none_failed", "all_done"]
 ReturnType = Literal["string", "list", "json", "image", "file"]
 OnExhausted = Literal["pause_for_user", "pass_latest", "fail_dag"]
+NO_BRANCH = "none"  # what an AgenticBranch with allow_none=True answers to select nothing
 
 EVALUATOR_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -60,7 +62,12 @@ class BaseOperator:
       skipped, fail if any upstream failed) or ``"all_done"`` (run whatever
       happened upstream; used by the DagEvaluator).
     * ``on_complete``: optional callback ``fn(engine, run, instance)`` (sync or
-      async) invoked after the node succeeds.
+      async) invoked after the node succeeds, before it counts as done.
+    * ``outlets``: assets (:class:`~agentic_airflow.triggers.Asset` or their
+      names) the node updates once all its instances have finished, if it
+      produced something: DAGs scheduled on them run with what it produced.
+    * ``skip_if``: optional ``fn(engine, run) -> str | None`` checked when the
+      node is about to be scheduled: a returned reason skips it.
     """
 
     kind: ClassVar[str] = "task"
@@ -77,6 +84,8 @@ class BaseOperator:
         follow_mapping: bool = False,
         trigger_rule: TriggerRule = "none_failed",
         on_complete: Callable[..., Any] | None = None,
+        outlets: Sequence[Any] | None = None,
+        skip_if: Callable[..., str | None] | None = None,
         dag: Any | None = None,
         group: Any | None = None,
         scope: ScopeConfig | None = None,
@@ -93,6 +102,8 @@ class BaseOperator:
         self.follow_mapping = bool(follow_mapping)
         self.trigger_rule: TriggerRule = trigger_rule
         self.on_complete = on_complete
+        self.outlets: list[str] = outlet_names(outlets)
+        self.skip_if = skip_if
         self.upstream: list[BaseOperator] = []
         self.downstream: list[BaseOperator] = []
         self._context_refs: list[BaseOperator | str] | None
@@ -181,6 +192,7 @@ class BaseOperator:
             "fan_out": self.fan_out,
             "follow_mapping": self.follow_mapping,
             "trigger_rule": self.trigger_rule,
+            "outlets": list(self.outlets),
             "group": self.group.id if self.group is not None and getattr(self.group, "is_dag", False) is False else None,
             "upstream": self.upstream_ids,
             "downstream": self.downstream_ids,
@@ -226,6 +238,8 @@ class Task(BaseOperator):
         follow_mapping: bool = False,
         trigger_rule: TriggerRule = "none_failed",
         on_complete: Callable[..., Any] | None = None,
+        outlets: Sequence[Any] | None = None,
+        skip_if: Callable[..., str | None] | None = None,
         dag: Any | None = None,
         group: Any | None = None,
     ):
@@ -238,6 +252,8 @@ class Task(BaseOperator):
             follow_mapping=follow_mapping,
             trigger_rule=trigger_rule,
             on_complete=on_complete,
+            outlets=outlets,
+            skip_if=skip_if,
             dag=dag,
             group=group,
         )
@@ -256,8 +272,8 @@ class Branch(Task):
     kind = "branch"
     is_branch = True
 
-    def __init__(self, id: str, fn: Callable[..., Any], *, context: Any = None, follow_mapping: bool = False, dag: Any | None = None, group: Any | None = None, on_complete: Callable[..., Any] | None = None):
-        super().__init__(id, fn, context=context, follow_mapping=follow_mapping, dag=dag, group=group, on_complete=on_complete)
+    def __init__(self, id: str, fn: Callable[..., Any], *, context: Any = None, follow_mapping: bool = False, dag: Any | None = None, group: Any | None = None, on_complete: Callable[..., Any] | None = None, skip_if: Callable[..., str | None] | None = None):
+        super().__init__(id, fn, context=context, follow_mapping=follow_mapping, dag=dag, group=group, on_complete=on_complete, skip_if=skip_if)
 
 
 def _accepts_ctx(fn: Callable[..., Any]) -> bool:
@@ -311,6 +327,8 @@ class AgenticTask(BaseOperator):
         system_prompt: str | None = None,
         trigger_rule: TriggerRule = "none_failed",
         on_complete: Callable[..., Any] | None = None,
+        outlets: Sequence[Any] | None = None,
+        skip_if: Callable[..., str | None] | None = None,
         dag: Any | None = None,
         group: Any | None = None,
     ):
@@ -339,6 +357,8 @@ class AgenticTask(BaseOperator):
             follow_mapping=follow_mapping,
             trigger_rule=trigger_rule,
             on_complete=on_complete,
+            outlets=outlets,
+            skip_if=skip_if,
             dag=dag,
             group=group,
             scope=scope,
@@ -364,23 +384,31 @@ class AgenticBranch(AgenticTask):
 
     The downstream ids are passed to the backend as a constrained ``enum``.
     ``multi_select=True`` lets the model activate several branches.
+    ``allow_none=True`` adds the choice ``"none"``, which selects nothing, so
+    every downstream task is skipped: a branch with a single downstream task is
+    then a yes or no.
     """
 
     kind = "agentic_branch"
     is_branch = True
 
-    def __init__(self, id: str, prompt: str, *, multi_select: bool = False, **kwargs: Any):
+    def __init__(self, id: str, prompt: str, *, multi_select: bool = False, allow_none: bool = False, **kwargs: Any):
         kwargs.pop("return_type", None)
         kwargs.pop("fan_out", None)
         super().__init__(id, prompt, return_type="string", fan_out=False, **kwargs)
         self.multi_select = bool(multi_select)
+        self.allow_none = bool(allow_none)
+
+    def choices(self) -> list[str]:
+        return [*self.downstream_ids, *([NO_BRANCH] if self.allow_none else [])]
 
     def output_spec(self, choices: Sequence[str] | None = None, **_: Any) -> OutputSpec:
-        return OutputSpec(kind="enum", choices=list(choices or self.downstream_ids), multi=self.multi_select)
+        return OutputSpec(kind="enum", choices=list(choices or self.choices()), multi=self.multi_select)
 
     def describe(self) -> dict[str, Any]:
         data = super().describe()
         data["multi_select"] = self.multi_select
+        data["allow_none"] = self.allow_none
         return data
 
 

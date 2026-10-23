@@ -8,6 +8,9 @@ three sets from spec §1:
 * **allowed / visible** - schema injected into the prompt, executes directly;
 * **hidden / on-demand** - allowed, but not injected until the agent calls the
   built-in ``search_tools`` tool;
+* **gated** - tools registered with ``approval="ask"`` (unless ``allowed_tools``
+  names them) or ``approval="always"``: injected, but every call pauses the
+  task for human approval;
 * **denied** - explicitly denied or outside ``allowed_tools``. Invocation
   pauses the task for human approval.
 """
@@ -32,7 +35,8 @@ from .validation import schema_errors
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 SEARCH_TOOL_NAME = "search_tools"
 
-ToolState = Literal["allowed", "hidden", "denied", "unknown"]
+ToolState = Literal["allowed", "hidden", "gated", "denied", "unknown"]
+Approval = Literal["none", "ask", "always"]
 
 _PY_TO_JSON = {
     str: {"type": "string"},
@@ -81,7 +85,7 @@ def schema_from_signature(fn: Callable[..., Any]) -> dict[str, Any]:
     props: dict[str, Any] = {}
     required: list[str] = []
     for name, param in inspect.signature(fn).parameters.items():
-        if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+        if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD) or name == "ctx":
             continue
         props[name] = _schema_for_annotation(hints.get(name, param.annotation))
         if param.default is inspect.Parameter.empty:
@@ -103,12 +107,33 @@ def _jsonable(value: Any) -> bool:
 
 
 @dataclass
+class ToolContext:
+    """Passed to tools whose function declares a ``ctx`` parameter: who is calling."""
+
+    run_id: str
+    dag_id: str
+    task_id: str
+    instance_id: str
+    map_path: tuple[int, ...] = ()
+    attempt: int = 1
+    engine: Any = None
+    run: Any = None
+
+
+@dataclass
 class Tool:
     """A callable exposed to agents.
 
     ``fn`` may be sync or async. Sync functions are executed on the engine's
     CPU worker pool so they never block the event loop. ``hidden=True`` makes
     the tool on-demand by default (discoverable via ``search_tools``).
+
+    ``approval`` says whether a call needs a human's OK: ``"none"`` (default);
+    ``"ask"``, unless the task's ``allowed_tools`` names the tool explicitly;
+    or ``"always"``, whatever ``allowed_tools`` says. A tool that needs it is
+    still offered to the model; calling it pauses the task for approval.
+
+    A function with a ``ctx`` parameter receives a :class:`ToolContext`.
     """
 
     name: str
@@ -117,12 +142,19 @@ class Tool:
     parameters: dict[str, Any] = field(default_factory=lambda: {"type": "object", "properties": {}})
     hidden: bool = False
     tags: tuple[str, ...] = ()
+    approval: Approval = "none"
 
     def __post_init__(self) -> None:
         if not TOOL_NAME_RE.match(self.name):
             raise ToolError(f"Invalid tool name {self.name!r}")
         if not isinstance(self.parameters, dict):
             raise ToolError(f"Tool {self.name!r}: parameters must be a JSON-schema dict")
+        if self.approval not in ("none", "ask", "always"):
+            raise ToolError(f"Tool {self.name!r}: approval must be 'none', 'ask' or 'always'")
+        try:
+            self.wants_ctx = "ctx" in inspect.signature(self.fn).parameters
+        except (TypeError, ValueError):
+            self.wants_ctx = False
 
     def spec(self) -> ToolSpec:
         return ToolSpec(name=self.name, description=self.description, parameters=self.parameters)
@@ -132,15 +164,20 @@ class Tool:
             return ["arguments must be a JSON object"]
         return schema_errors(arguments, self.parameters)
 
-    async def invoke(self, arguments: dict[str, Any], *, executor: Executor | None = None) -> Any:
+    async def invoke(
+        self, arguments: dict[str, Any], *, executor: Executor | None = None, ctx: ToolContext | None = None
+    ) -> Any:
         """Validate and execute the tool, returning its raw result."""
         errs = self.validate_arguments(arguments)
         if errs:
             raise ToolError(f"Invalid arguments for {self.name}: " + "; ".join(errs))
+        kwargs = dict(arguments)
+        if self.wants_ctx:
+            kwargs["ctx"] = ctx
         if inspect.iscoroutinefunction(self.fn):
-            return await self.fn(**arguments)
+            return await self.fn(**kwargs)
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(executor, functools.partial(self.fn, **arguments))
+        result = await loop.run_in_executor(executor, functools.partial(self.fn, **kwargs))
         if inspect.isawaitable(result):
             result = await result
         return result
@@ -152,6 +189,7 @@ class Tool:
             "parameters": self.parameters,
             "hidden": self.hidden,
             "tags": list(self.tags),
+            "approval": self.approval,
         }
 
 
@@ -163,6 +201,7 @@ def tool(
     parameters: dict[str, Any] | None = None,
     hidden: bool = False,
     tags: Iterable[str] = (),
+    approval: Approval = "none",
 ) -> Any:
     """Decorator turning a function into a :class:`Tool`.
 
@@ -183,6 +222,7 @@ def tool(
             parameters=parameters if parameters is not None else schema_from_signature(f),
             hidden=hidden,
             tags=tuple(tags),
+            approval=approval,
         )
 
     return wrap(fn) if fn is not None else wrap
@@ -248,24 +288,36 @@ class ToolPermissions:
     allowed: frozenset[str]
     """Tools the task may execute without approval (includes hidden ones)."""
     hidden: frozenset[str]
-    """Subset of ``allowed`` that is on-demand (not injected until discovered)."""
+    """Subset of ``allowed | gated`` that is on-demand (not injected until discovered)."""
     denied: frozenset[str]
-    """Registered tools the task may not call without approval."""
+    """Registered tools the task may not call without approval; never offered."""
+    gated: frozenset[str] = frozenset()
+    """Tools offered to the task, each call of which pauses for approval."""
+    always: frozenset[str] = frozenset()
+    """Subset of ``gated`` whose approval can't be remembered for the rest of a run."""
+
+    @property
+    def offered(self) -> frozenset[str]:
+        """Tools the task may call, with or without approval: what it's offered or can discover."""
+        return self.allowed | self.gated
 
     @property
     def visible(self) -> frozenset[str]:
-        return self.allowed - self.hidden
+        return self.offered - self.hidden
 
     def state(self, name: str, registered: bool = True) -> ToolState:
         if name in self.allowed:
             return "hidden" if name in self.hidden else "allowed"
+        if name in self.gated:
+            return "gated"
         if registered or name in self.denied:
             return "denied"
         return "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "allowed": sorted(self.visible),
+            "allowed": sorted(self.allowed - self.hidden),
+            "gated": sorted(self.gated - self.hidden),
             "hidden": sorted(self.hidden),
             "denied": sorted(self.denied),
         }
@@ -285,13 +337,31 @@ def resolve_permissions(
     """
     registered = set(registry.names())
     overrides = overrides or {}
-    base = set(config.allowed_tools) if config.allowed_tools is not None else set(registered)
-    base |= set(overrides.get("allow") or [])
+    named = set(config.allowed_tools or []) | set(overrides.get("allow") or [])
     denied_explicit = set(config.denied_tools) | set(overrides.get("deny") or [])
-    allowed = (base - denied_explicit) & registered
-    denied = (registered - allowed)
-    hidden = (set(config.hidden_tools) | registry.hidden_by_default() | set(overrides.get("hide") or [])) & allowed
-    return ToolPermissions(allowed=frozenset(allowed), hidden=frozenset(hidden), denied=frozenset(denied))
+    allowed: set[str] = set()
+    gated: set[str] = set()
+    always: set[str] = set()
+    for name in registered - denied_explicit:
+        approval = registry.get(name).approval  # type: ignore[union-attr]
+        if approval == "always":
+            gated.add(name)
+            always.add(name)
+        elif approval == "ask":
+            (allowed if name in named else gated).add(name)
+        elif config.allowed_tools is None or name in named:
+            allowed.add(name)
+    denied = registered - allowed - gated
+    hidden = (set(config.hidden_tools) | registry.hidden_by_default() | set(overrides.get("hide") or [])) & (
+        allowed | gated
+    )
+    return ToolPermissions(
+        allowed=frozenset(allowed),
+        hidden=frozenset(hidden),
+        denied=frozenset(denied),
+        gated=frozenset(gated),
+        always=frozenset(always),
+    )
 
 
 def search_tools_spec() -> ToolSpec:

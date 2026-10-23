@@ -205,6 +205,8 @@ class DagRun:
     instances: dict[str, TaskInstance] = field(default_factory=dict)
     node_instances: dict[str, list[str]] = field(default_factory=dict)
     expanded: list[str] = field(default_factory=list)
+    done_nodes: list[str] = field(default_factory=list)
+    """Nodes whose instances have all finished (``node.finished`` emitted, outlets updated)."""
     log: list[RunLogEntry] = field(default_factory=list)
     chat_log: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
@@ -243,6 +245,7 @@ class DagRun:
             "instances": {k: v.to_dict() for k, v in self.instances.items()},
             "node_instances": self.node_instances,
             "expanded": list(self.expanded),
+            "done_nodes": list(self.done_nodes),
             "log": [e.to_dict() for e in self.log],
             "chat_log": self.chat_log,
             "error": self.error,
@@ -265,6 +268,7 @@ class DagRun:
             instances={k: TaskInstance.from_dict(v) for k, v in (d.get("instances") or {}).items()},
             node_instances={k: list(v) for k, v in (d.get("node_instances") or {}).items()},
             expanded=list(d.get("expanded") or []),
+            done_nodes=list(d.get("done_nodes") or []),
             log=[RunLogEntry(**e) for e in d.get("log") or []],
             chat_log=list(d.get("chat_log") or []),
             error=d.get("error"),

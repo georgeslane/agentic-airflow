@@ -102,6 +102,7 @@ def build_graph(dag: Dag, run: DagRun | None = None) -> dict[str, Any]:
             "fan_out": t.fan_out,
             "follow_mapping": t.follow_mapping,
             "trigger_rule": t.trigger_rule,
+            "outlets": list(t.outlets),
             "prompt": getattr(t, "prompt", None),
             "return_type": getattr(t, "return_type", None),
             "config": t.scope.to_dict(),

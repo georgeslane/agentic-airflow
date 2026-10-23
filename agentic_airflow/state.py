@@ -24,6 +24,7 @@ class StateStore(Protocol):
     def save_run(self, run: dict[str, Any]) -> None: ...
     def get_run(self, run_id: str) -> dict[str, Any] | None: ...
     def list_runs(self, dag_id: str | None = None, status: str | Iterable[str] | None = None, limit: int = 50) -> list[dict[str, Any]]: ...
+    def delete_run(self, run_id: str) -> None: ...
     # memory + overrides (per dag)
     def get_memory(self, dag_id: str) -> dict[str, Any]: ...
     def set_memory(self, dag_id: str, memory: dict[str, Any]) -> None: ...
@@ -89,6 +90,14 @@ class InMemoryStateStore:
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         return self._get("runs", run_id)
+
+    def delete_run(self, run_id: str) -> None:
+        """Delete a run and its approvals."""
+        with self._lock:
+            self._docs.get("runs", {}).pop(run_id, None)
+            approvals = self._docs.get("approvals", {})
+            for key in [k for k, a in approvals.items() if a.get("run_id") == run_id]:
+                approvals.pop(key)
 
     def list_runs(self, dag_id=None, status=None, limit=50):
         statuses = {status} if isinstance(status, str) else (set(status) if status else None)
@@ -237,6 +246,11 @@ class SqliteStateStore(InMemoryStateStore):
 
     def get_run(self, run_id):
         return self._read("runs", run_id)
+
+    def delete_run(self, run_id):
+        with self._lock:
+            self._conn.execute("DELETE FROM documents WHERE collection='runs' AND key=?", (run_id,))
+            self._conn.execute("DELETE FROM documents WHERE collection='approvals' AND scope=?", (run_id,))
 
     def list_runs(self, dag_id=None, status=None, limit=50):
         statuses = [status] if isinstance(status, str) else (list(status) if status else None)

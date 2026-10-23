@@ -43,16 +43,16 @@ python -m pytest
 
 | Area | Highlights |
 |---|---|
-| **Operators** | `Task`, `Branch` (deterministic, run on a CPU thread pool), `AgenticTask`, `AgenticBranch`, `AgenticEvaluator` (LLM). Airflow `>>` syntax. |
+| **Operators** | `Task`, `Branch` (deterministic, run on a CPU thread pool), `AgenticTask`, `AgenticBranch` (`allow_none` for a yes or no), `AgenticEvaluator` (LLM). Airflow `>>` syntax; `outlets`, `skip_if`; ready-made `trigger_items` and `found_nothing`. |
 | **Config cascade** | System → Dag → TaskGroup → Task. `model`/`thinking`/`verbosity` inherit; skills are additive (`inherit_skills=False` to isolate); `denied_tools` always beat `allowed_tools`. |
-| **Three-state tools** | allowed (schema injected), hidden/on-demand (discoverable via the built-in `search_tools`), denied (the task checkpoints and pauses for approval). |
+| **Tool states** | allowed (schema injected), hidden/on-demand (discoverable via the built-in `search_tools`), gated (`approval="ask"`/`"always"`: offered, each call pauses for approval), denied (the task checkpoints and pauses for approval). Tools can take a `ctx` saying who called them. |
 | **Dynamic mapping** | `fan_out=True` + list output → `task_0 … task_N-1`; joins receive an index-ordered dict; empty lists skip the chain; nested mapping works. |
 | **Reflection loops** | `AgenticEvaluator` reruns its target with `retry_history`, bounded by `max_retries` and `on_exhausted`. |
-| **Engine** | asyncio, per-model priority queues (live chat = tier 0, DAG work = aging FIFO), one inference step per slot so users preempt at atomic boundaries, checkpoint after every step. |
+| **Engine** | asyncio; runs queue first come, first served, one at a time per model (`max_active_runs_per_model`); per-model priority queues where live users (`user_slot`, `chat`) go before DAG work but never interrupt a running task (`atomic="task"`); `task_timeout`, `approval_timeout`; checkpoint after every step; runs keep the DAG they started with. |
 | **Human in the loop** | Denied tool calls and exhausted evaluators pause only the affected lane; parallel work continues. `approve()`, `reject()`, `decide()`. |
-| **Triggers** | cron strings (5-field, timezone aware, no dependency), `DagTrigger` (on another DAG's completion), `WebhookTrigger` (HMAC-SHA256 signed). |
+| **Triggers** | cron strings (5-field, timezone aware, no dependency, never piling up), `DagTrigger` (on another DAG's completion), `WebhookTrigger` (HMAC-SHA256 signed), `Asset` (updated by tasks' `outlets`, as in Airflow). DAGs can't trigger each other in a circle; `pause()` a DAG. |
 | **DagEvaluator** | Five-task group auto-attached to terminal nodes: critique, tool audit, skill rewriter, memory compactor, executive summary. Recommendations are staged and only applied after `approve_recommendation()`. |
-| **Persistence** | `InMemoryStateStore` or `SqliteStateStore` (stdlib). Runs, checkpoints, approvals, memory, skill versions and overrides survive restarts; `resume_interrupted()` picks up where a process died. |
+| **Persistence** | `InMemoryStateStore` or `SqliteStateStore` (stdlib). Runs, checkpoints, approvals, memory, skill versions and overrides survive restarts; `resume_interrupted()` picks up where a process died; `keep_runs` prunes old runs. |
 | **UI** | `engine.graph()` JSON, `render_html()` self-contained page, `render_embed()` fragment, optional `UIServer` (stdlib HTTP, bearer token, CSP). |
 
 ## Documentation

@@ -10,14 +10,19 @@ checkpoint to one of three outcomes:
   released (spec §5);
 * an exception - the task failed (budget exceeded, invalid output, tool crash).
 
-Each loop iteration is one **atomic inference step**: acquire a slot in the
-model's priority queue, call the backend once, release the slot, then execute
-the returned tool calls. Checkpoints are written after every step so a paused
-or crashed task resumes from the exact message it stopped at.
+Each loop iteration is one inference step: call the backend once, then execute
+the returned tool calls. With ``EngineConfig.atomic="task"`` (the default) the
+task holds a slot in the model's priority queue from its first step to its
+answer, so a live user request waits for it and goes before the next task;
+with ``"step"`` it holds one for each call to the backend. Either way the slot
+is given up when the task pauses for approval. Checkpoints are written after
+every step so a paused or crashed task resumes from the exact message it
+stopped at.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from dataclasses import dataclass
@@ -29,7 +34,7 @@ from .models import GenerationRequest, Message, OutputSpec, ToolCall, ToolSpec
 from .operators import AgenticBranch, AgenticTask
 from .priority import DAG_PRIORITY
 from .run import DagRun, Event, TaskInstance
-from .tools import SEARCH_TOOL_NAME, ToolPermissions, format_tool_result, search_tools_spec
+from .tools import SEARCH_TOOL_NAME, ToolContext, ToolPermissions, format_tool_result, search_tools_spec
 from .validation import coerce_output
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -93,6 +98,8 @@ def build_system_prompt(
             guidance.append(
                 f"Additional tools exist but are not loaded; call `{SEARCH_TOOL_NAME}` with keywords to discover and enable them."
             )
+        if perms.gated:
+            guidance.append("Some tools need a human's approval each time: calling one pauses the task until they answer.")
         guidance.append(
             "Calling a tool you have not been granted pauses the task for human approval; only do so when it is genuinely required."
         )
@@ -168,14 +175,14 @@ async def run_agentic_instance(
         raise ConfigurationError(
             f"Task {op.id!r}: no model resolved. Set model= on the task, group, DAG or EngineConfig."
         )
-    dag = engine.dags[run.dag_id]
+    dag = engine.dag_for(run)
     overrides = engine.overrides_for(run.dag_id)
     prompt = (overrides.get("prompts") or {}).get(op.id) or op.prompt
     dag_prompt = (overrides.get("prompts") or {}).get("__dag__") or dag.prompt
 
     choices: list[str] | None = None
     if isinstance(op, AgenticBranch):
-        choices = op.downstream_ids
+        choices = op.choices()
         output_spec = op.output_spec(choices=choices)
     else:
         output_spec = op.output_spec()
@@ -186,7 +193,7 @@ async def run_agentic_instance(
     # Restore or initialise the checkpoint ---------------------------------
     ck = inst.checkpoint or {}
     messages = [Message.from_dict(m) for m in ck.get("messages") or []]
-    discovered: set[str] = set(ck.get("discovered") or [])
+    discovered: list[str] = list(ck.get("discovered") or [])  # in the order found, so the tool list only grows
     tool_steps: int = int(ck.get("tool_steps") or 0)
     output_retries_left: int = int(ck.get("output_retries_left", engine.config.output_retries))
     pending: dict[str, Any] | None = ck.get("pending")
@@ -201,25 +208,30 @@ async def run_agentic_instance(
         )
         messages = [Message(role="user", content=user_prompt)]
 
-    def allowed_now() -> set[str]:
-        return set(perms.allowed) | set(run.approved_tools)
+    def offered_now() -> list[str]:
+        """The tools offered: visible ones, then those discovered or approved for the run, in that order, so the
+        list only grows and a model server's prompt cache of it holds."""
+        names = sorted(perms.visible)
+        for name in [*discovered, *run.approved_tools]:
+            if name not in names and name in registry:
+                names.append(name)
+        return names
 
     def current_tool_specs(budget_exhausted: bool) -> list[ToolSpec]:
         if budget_exhausted:
             return []
-        names = sorted((perms.visible | discovered) & allowed_now())
-        specs = registry.specs(names)
-        if perms.hidden - discovered:
+        specs = registry.specs(offered_now())
+        if perms.hidden - set(discovered):
             specs.append(search_tools_spec())
         return specs
 
-    tools_available = bool(perms.allowed) or bool(run.approved_tools)
+    tools_available = bool(perms.offered) or bool(run.approved_tools)
     system = build_system_prompt(engine, dag_prompt, op, cfg, perms, output_spec, tools_available=tools_available)
 
     def save_checkpoint(pending_state: dict[str, Any] | None = None) -> None:
         inst.checkpoint = {
             "messages": [m.to_dict() for m in messages],
-            "discovered": sorted(discovered),
+            "discovered": list(discovered),
             "tool_steps": tool_steps,
             "output_retries_left": output_retries_left,
             "pending": pending_state,
@@ -234,9 +246,9 @@ async def run_agentic_instance(
         tool = registry.get(call.name)
         if call.name == SEARCH_TOOL_NAME:
             query = str((call.arguments or {}).get("query") or "")
-            found = registry.search(query, within=perms.hidden - discovered) if query else []
+            found = registry.search(query, within=perms.hidden - set(discovered)) if query else []
             for t in found:
-                discovered.add(t.name)
+                discovered.append(t.name)
             result = {"tools": [t.spec().to_dict() for t in found]} if found else {
                 "tools": [],
                 "message": "No additional tools matched. The tools already available are the complete set.",
@@ -246,12 +258,16 @@ async def run_agentic_instance(
             engine._chat_event(cfg, 1, Event("tool_call", run.run_id, run.dag_id, op.id, inst.instance_id, {"name": call.name, "arguments": call.arguments, "status": "ok"}))
             return record
         if tool is None:
-            msg = f"Error: unknown tool {call.name!r}. Available tools: {sorted((perms.visible | discovered) & allowed_now())}."
+            msg = f"Error: unknown tool {call.name!r}. Available tools: {offered_now()}."
             record.update(status="error", result=msg)
             messages.append(Message(role="tool", name=call.name, tool_call_id=call.id, content=msg))
             return record
         try:
-            result = await tool.invoke(dict(call.arguments or {}), executor=engine.cpu_pool)
+            ctx = ToolContext(
+                run_id=run.run_id, dag_id=run.dag_id, task_id=op.id, instance_id=inst.instance_id,
+                map_path=inst.map_path, attempt=inst.attempt, engine=engine, run=run,
+            )
+            result = await tool.invoke(dict(call.arguments or {}), executor=engine.cpu_pool, ctx=ctx)
             text = format_tool_result(result, max_chars)
             record.update(status="approved" if force else "ok", result=text)
         except ToolError as exc:
@@ -270,105 +286,117 @@ async def run_agentic_instance(
         for index in range(start, len(calls)):
             call = calls[index]
             state = perms.state(call.name, registered=call.name in registry)
-            if call.name == SEARCH_TOOL_NAME or call.name in run.approved_tools:
+            if call.name == SEARCH_TOOL_NAME or (call.name in run.approved_tools and call.name not in perms.always):
                 state = "allowed"
-            if state == "denied":
+            if state in ("denied", "gated"):
                 pending_state = {"calls": [c.to_dict() for c in calls], "index": index, "decision": None}
                 save_checkpoint(pending_state)
                 return {
                     "tool_call": call.to_dict(),
-                    "reason": "denied_tool" if call.name in perms.denied else "outside_allowed_tools",
+                    "reason": "requires_approval" if state == "gated" else "denied_tool",
                     "description": (registry.get(call.name).description if registry.get(call.name) else ""),
                 }
             inst.tool_calls.append(await execute_tool_call(call))
         return None
 
-    # Resume a pending approval --------------------------------------------
-    if pending:
-        decision = pending.get("decision")
-        if decision is None:
-            # Should not happen (engine re-queues only after a decision); treat as still waiting.
-            return AgentOutcome("awaiting_tool_approval", payload={"tool_call": pending["calls"][pending["index"]]})
-        calls = [ToolCall.from_dict(c) for c in pending["calls"]]
-        index = int(pending["index"])
-        call = calls[index]
-        if decision.get("approved"):
-            if decision.get("remember") and call.name not in run.approved_tools:
-                run.approved_tools.append(call.name)
-            record = await execute_tool_call(call, force=True)
-            inst.tool_calls.append(record)
-        else:
-            reason = decision.get("reason") or "The user rejected this tool call."
-            text = f"Tool call denied by the user: {reason} Adjust your approach without this tool."
-            messages.append(Message(role="tool", name=call.name, tool_call_id=call.id, content=text))
-            inst.tool_calls.append({"id": call.id, "name": call.name, "arguments": call.arguments, "status": "rejected", "result": text, "step": tool_steps})
-        payload = await process_tool_calls(calls, index + 1)
-        if payload is not None:
-            return AgentOutcome("awaiting_tool_approval", payload=payload)
-        pending = None
-        save_checkpoint(None)
-
-    # Main step loop ---------------------------------------------------------
     queue = engine.queues.get(model)
-    while True:
-        if engine._cancel_requested_for(run):
-            raise RuntimeError("Run cancelled")
-        budget_exhausted = tool_steps >= cfg.max_tool_steps
-        request = GenerationRequest(
-            model=model,
-            system=system,
-            messages=list(messages),
-            tools=current_tool_specs(budget_exhausted),
-            output=output_spec,
-            thinking=cfg.thinking,
-            metadata={
-                "dag_id": run.dag_id,
-                "run_id": run.run_id,
-                "task_id": op.id,
-                "instance_id": inst.instance_id,
-                "attempt": inst.attempt,
-                "step": len([m for m in messages if m.role == "assistant"]) + 1,
-                "priority": DAG_PRIORITY,
-                "kind": op.kind,
-            },
-        )
-        async with queue.slot(DAG_PRIORITY, run.created_at):
-            response = await backend.generate(request)
-        for key, value in (response.usage or {}).items():
-            if isinstance(value, (int, float)):
-                inst.usage[key] = inst.usage.get(key, 0) + int(value)
-        assistant = Message(role="assistant", content=response.text or "", tool_calls=list(response.tool_calls), reasoning=response.reasoning)
-        messages.append(assistant)
-        if response.reasoning:
-            engine._chat_event(cfg, 2, Event("reasoning", run.run_id, run.dag_id, op.id, inst.instance_id, {"text": response.reasoning}))
+    atomic = engine.config.atomic == "task"
+    timeout = engine.config.task_timeout
 
-        if response.tool_calls:
-            if budget_exhausted:
-                raise RuntimeError(
-                    f"max_tool_steps ({cfg.max_tool_steps}) exceeded: the model kept requesting tools after the budget was spent"
-                )
-            tool_steps += 1
-            payload = await process_tool_calls(list(response.tool_calls), 0)
+    async def work(started: float) -> AgentOutcome:
+        nonlocal pending, tool_steps, output_retries_left
+        # Resume a pending approval --------------------------------------------
+        if pending:
+            decision = pending.get("decision")
+            if decision is None:
+                # Should not happen (engine re-queues only after a decision); treat as still waiting.
+                return AgentOutcome("awaiting_tool_approval", payload={"tool_call": pending["calls"][pending["index"]]})
+            calls = [ToolCall.from_dict(c) for c in pending["calls"]]
+            index = int(pending["index"])
+            call = calls[index]
+            if decision.get("approved"):
+                if decision.get("remember") and call.name not in run.approved_tools and call.name not in perms.always:
+                    run.approved_tools.append(call.name)
+                record = await execute_tool_call(call, force=True)
+                inst.tool_calls.append(record)
+            else:
+                reason = decision.get("reason") or "The user rejected this tool call."
+                text = f"Tool call denied by the user: {reason} Adjust your approach without this tool."
+                messages.append(Message(role="tool", name=call.name, tool_call_id=call.id, content=text))
+                inst.tool_calls.append({"id": call.id, "name": call.name, "arguments": call.arguments, "status": "rejected", "result": text, "step": tool_steps})
+            payload = await process_tool_calls(calls, index + 1)
             if payload is not None:
                 return AgentOutcome("awaiting_tool_approval", payload=payload)
-            if tool_steps >= cfg.max_tool_steps:
-                messages.append(Message(role="user", content=(
-                    "Tool budget exhausted. Do not call any more tools; respond now with your final answer "
-                    "according to the output contract."
-                )))
+            pending = None
             save_checkpoint(None)
-            continue
 
-        # Final answer --------------------------------------------------------
-        try:
-            value = coerce_output(response, output_spec)
-        except OutputValidationError as exc:
-            if output_retries_left > 0:
-                output_retries_left -= 1
-                messages.append(Message(role="user", content=f"Your response was rejected: {exc} Try again following the output contract exactly."))
+        # Main step loop ---------------------------------------------------------
+        while True:
+            if engine._cancel_requested_for(run):
+                raise RuntimeError("Run cancelled")
+            if timeout is not None and time.monotonic() - started > timeout:
+                raise TimeoutError(f"task_timeout ({timeout:g}s) exceeded before the task finished")
+            budget_exhausted = tool_steps >= cfg.max_tool_steps
+            request = GenerationRequest(
+                model=model,
+                system=system,
+                messages=list(messages),
+                tools=current_tool_specs(budget_exhausted),
+                output=output_spec,
+                thinking=cfg.thinking,
+                metadata={
+                    "dag_id": run.dag_id,
+                    "run_id": run.run_id,
+                    "task_id": op.id,
+                    "instance_id": inst.instance_id,
+                    "attempt": inst.attempt,
+                    "step": len([m for m in messages if m.role == "assistant"]) + 1,
+                    "priority": DAG_PRIORITY,
+                    "kind": op.kind,
+                },
+            )
+            async with (contextlib.nullcontext() if atomic else queue.slot(DAG_PRIORITY, run.created_at)):
+                response = await backend.generate(request)
+            for key, value in (response.usage or {}).items():
+                if isinstance(value, (int, float)):
+                    inst.usage[key] = inst.usage.get(key, 0) + int(value)
+            assistant = Message(role="assistant", content=response.text or "", tool_calls=list(response.tool_calls), reasoning=response.reasoning)
+            messages.append(assistant)
+            if response.reasoning:
+                engine._chat_event(cfg, 2, Event("reasoning", run.run_id, run.dag_id, op.id, inst.instance_id, {"text": response.reasoning}))
+
+            if response.tool_calls:
+                if budget_exhausted:
+                    raise RuntimeError(
+                        f"max_tool_steps ({cfg.max_tool_steps}) exceeded: the model kept requesting tools after the budget was spent"
+                    )
+                tool_steps += 1
+                payload = await process_tool_calls(list(response.tool_calls), 0)
+                if payload is not None:
+                    return AgentOutcome("awaiting_tool_approval", payload=payload)
+                if tool_steps >= cfg.max_tool_steps:
+                    messages.append(Message(role="user", content=(
+                        "Tool budget exhausted. Do not call any more tools; respond now with your final answer "
+                        "according to the output contract."
+                    )))
                 save_checkpoint(None)
                 continue
-            raise
-        engine._chat_event(cfg, 2, Event("response", run.run_id, run.dag_id, op.id, inst.instance_id, {"text": response.text, "output": value}))
-        save_checkpoint(None)
-        return AgentOutcome("success", value=value)
+
+            # Final answer --------------------------------------------------------
+            try:
+                value = coerce_output(response, output_spec)
+            except OutputValidationError as exc:
+                if output_retries_left > 0:
+                    output_retries_left -= 1
+                    messages.append(Message(role="user", content=f"Your response was rejected: {exc} Try again following the output contract exactly."))
+                    save_checkpoint(None)
+                    continue
+                raise
+            engine._chat_event(cfg, 2, Event("response", run.run_id, run.dag_id, op.id, inst.instance_id, {"text": response.text, "output": value}))
+            save_checkpoint(None)
+            return AgentOutcome("success", value=value)
+
+    if atomic:  # the task keeps the model from its first step to its answer, or until it pauses
+        async with queue.slot(DAG_PRIORITY, run.created_at):
+            return await work(time.monotonic())
+    return await work(time.monotonic())

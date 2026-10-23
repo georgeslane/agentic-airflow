@@ -147,6 +147,24 @@ class EngineConfig(ScopeConfig):
       to the model with corrective feedback before the task fails.
     * ``persist_every_step``: checkpoint the run after every inference step
       (safer) rather than only on task boundaries (faster).
+    * ``atomic``: what holds a model slot. ``"task"`` (default): an agentic
+      task keeps its slot from its first inference step to its answer, so
+      live user requests wait for the running task and then go before the
+      next one. ``"step"``: the slot is held for one inference step at a time,
+      so users cut in between steps.
+    * ``max_active_runs_per_model``: how many runs may be active (running or
+      paused) at once among the DAGs whose resolved model is the same. Runs
+      beyond it wait in a first-come, first-served queue. ``None``: no limit.
+    * ``approval_timeout``: seconds a human decision may stay pending before
+      it is resolved for them (a tool call is rejected, an exhausted evaluator
+      fails). ``None``: they wait forever.
+    * ``task_timeout``: seconds an agentic task may work, counted from when it
+      gets its model slot (time paused for approval does not count). ``None``:
+      no limit.
+    * ``max_mapped``: the most mapped instances one fan-out list creates; longer
+      lists are cut short.
+    * ``keep_runs``: how many finished runs of each DAG are kept in the state
+      store; older ones are deleted. ``None``: all of them.
     """
 
     model_concurrency: dict[str, int] = field(default_factory=dict)
@@ -155,3 +173,20 @@ class EngineConfig(ScopeConfig):
     max_context_chars: int = 60_000
     output_retries: int = 1
     persist_every_step: bool = True
+    atomic: Literal["task", "step"] = "task"
+    max_active_runs_per_model: int | None = 1
+    approval_timeout: float | None = None
+    task_timeout: float | None = None
+    max_mapped: int = 100
+    keep_runs: int | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.atomic not in ("task", "step"):
+            raise ValueError("atomic must be 'task' or 'step'")
+        if self.max_active_runs_per_model is not None and self.max_active_runs_per_model < 1:
+            raise ValueError("max_active_runs_per_model must be >= 1 or None")
+        if self.max_mapped < 1:
+            raise ValueError("max_mapped must be >= 1")
+        if self.keep_runs is not None and self.keep_runs < 1:
+            raise ValueError("keep_runs must be >= 1 or None")

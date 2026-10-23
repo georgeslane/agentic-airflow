@@ -28,7 +28,8 @@ This page is written for an AI agent (or a developer in a hurry) that needs to u
 | Change how prompts are built | `agent_loop.build_system_prompt`, `build_user_prompt` |
 | Change mapping/join semantics | `engine.Engine._expand_node` (see `docs/architecture.md` for the algorithm) |
 | Add a new human decision type | `engine.Engine._create_approval` / `decide` |
-| Add a trigger type | `triggers.py` + handling in `engine.Engine` (`_cron_loop`, `deliver_webhook`, `_fire_dag_triggers`) |
+| Add a trigger type | `triggers.py` + handling in `engine.Engine` (`_cron_loop`, `deliver_webhook`, `update_asset`, `_fire_dag_triggers`) |
+| Change how runs queue | `engine.Engine._start_queued_runs` |
 | Add persistence backend | implement `state.StateStore` (see `InMemoryStateStore`) |
 | Add an API route | `ui/server.py::_Handler._api_get/_api_post` |
 | Change the DagEvaluator prompts/schemas | `evaluator.py` |
@@ -38,6 +39,8 @@ This page is written for an AI agent (or a developer in a hurry) that needs to u
 * `generate()` is called with a complete conversation every time; never mutate `request.messages`.
 * An instance id is `task_id` or `task_id_<i>[_<j>…]`; task ids are validated not to collide with these.
 * Terminal statuses never change except through `reset_for_retry()` by an evaluator rerun or a user `retry` decision.
+* A started run uses the `Dag` it started with (`engine.dag_for(run)`), never one registered since.
+* `engine.runs` holds unfinished runs only; finished ones are read back from the state store.
 * `denied` always wins; `run.approved_tools` only widens for the current run.
 * Everything stored must be JSON-serialisable (`DagRun.to_dict()` is the contract).
 * Tests in `tests/` cover each invariant; run `python -m pytest` after any change.

@@ -8,7 +8,7 @@ from typing import Any, Iterable
 from . import _context
 from .config import ScopeConfig, Thinking
 from .errors import DagValidationError
-from .operators import AgenticBranch, AgenticEvaluator, BaseOperator, Branch
+from .operators import NO_BRANCH, AgenticBranch, AgenticEvaluator, BaseOperator, Branch
 from .triggers import Trigger, normalise_schedule
 
 DAG_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
@@ -252,6 +252,15 @@ class Dag:
     def leaves(self) -> list[BaseOperator]:
         return [t for t in self.tasks.values() if not t.downstream]
 
+    def own_tasks(self) -> list[BaseOperator]:
+        """The tasks of the DAG itself: all but those of its evaluator group."""
+        group = self.evaluator_group
+        return [t for t in self.tasks.values() if group is None or t.group is not group]
+
+    def outlets(self) -> list[str]:
+        """The assets the DAG's tasks update."""
+        return list(dict.fromkeys(name for t in self.tasks.values() for name in t.outlets))
+
     def topological_order(self) -> list[BaseOperator]:
         indeg = {t.id: len(t.upstream) for t in self.tasks.values()}
         ready = [t for t in self.tasks.values() if indeg[t.id] == 0]
@@ -335,8 +344,24 @@ class Dag:
                         )
                 if op.target.is_evaluator:
                     raise DagValidationError(f"AgenticEvaluator {op.id!r} cannot evaluate another evaluator")
-            if isinstance(op, (Branch, AgenticBranch)) and not op.downstream:
-                raise DagValidationError(f"Branch {op.id!r} has no downstream tasks to select from")
+                others = [d.id for d in op.target.downstream if not d.is_evaluator]
+                if others:
+                    # They would run on the first output, before the evaluator could have it redone.
+                    raise DagValidationError(
+                        f"Task {op.target.id!r} is evaluated by {op.id!r}, so the tasks that use its output "
+                        f"({others}) must come after {op.id!r}, not after {op.target.id!r}"
+                    )
+            if isinstance(op, (Branch, AgenticBranch)):
+                if not op.downstream:
+                    raise DagValidationError(f"Branch {op.id!r} has no downstream tasks to select from")
+                if op.outlets:
+                    raise DagValidationError(
+                        f"Branch {op.id!r} can't have outlets: give them to the tasks it selects"
+                    )
+                if isinstance(op, AgenticBranch) and op.allow_none and NO_BRANCH in op.downstream_ids:
+                    raise DagValidationError(
+                        f"Branch {op.id!r} allows none, so no task after it can be called {NO_BRANCH!r}"
+                    )
         self._validated = True
         return self
 

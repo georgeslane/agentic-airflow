@@ -1,8 +1,9 @@
-"""Triggers that start DAG runs: cron schedules, other DAGs and webhooks.
+"""Triggers that start DAG runs: cron schedules, other DAGs, webhooks and assets.
 
 ``Dag(schedule=[...])`` accepts plain cron strings (converted to
-:class:`CronTrigger`), :class:`DagTrigger` and :class:`WebhookTrigger`
-instances.
+:class:`CronTrigger`), :class:`DagTrigger`, :class:`WebhookTrigger` and
+:class:`AssetTrigger` (``Asset``) instances. An asset is updated by a task
+whose ``outlets`` name it, or by :meth:`Engine.update_asset`, as in Airflow.
 """
 
 from __future__ import annotations
@@ -235,6 +236,38 @@ class WebhookTrigger(Trigger):
         return {"kind": "webhook", "name": self.name, "signed": bool(self.secret)}
 
 
+@dataclass
+class AssetTrigger(Trigger):
+    """Fire when the named asset is updated: by a task with it in its ``outlets``
+    (the run gets what the task produced) or by :meth:`Engine.update_asset`."""
+
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        self.kind = "asset"
+        if not _WEBHOOK_NAME_RE.match(self.name or ""):
+            raise TriggerError(f"Invalid asset name {self.name!r}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": "asset", "name": self.name}
+
+
+def outlet_names(outlets: Iterable[Any] | None) -> list[str]:
+    """The asset names of an operator's ``outlets`` (assets or their names)."""
+    if outlets is None:
+        return []
+    if isinstance(outlets, (str, AssetTrigger)):
+        outlets = [outlets]
+    names: list[str] = []
+    for item in outlets:
+        name = item.name if isinstance(item, AssetTrigger) else item
+        if not isinstance(name, str) or not _WEBHOOK_NAME_RE.match(name):
+            raise TriggerError(f"Invalid outlet {item!r}: give an Asset or an asset name")
+        if name not in names:
+            names.append(name)
+    return names
+
+
 def normalise_schedule(schedule: Iterable[Any] | Any | None) -> list[Trigger]:
     """Accept strings / Trigger instances (or a single one) and return Triggers."""
     if schedule is None:
@@ -255,3 +288,4 @@ def normalise_schedule(schedule: Iterable[Any] | Any | None) -> list[Trigger]:
 # Short aliases matching the spec's vocabulary.
 Cron = CronTrigger
 Webhook = WebhookTrigger
+Asset = AssetTrigger
