@@ -290,3 +290,26 @@ async def test_an_evaluator_task_failing_doesnt_fail_the_run(make_engine, backen
         run = await engine.run("ev_fails", timeout=5)
     assert run.status == RunStatus.SUCCESS
     assert run.instances["dag_evaluator.workflow_critique"].status.value == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lane_fails_only_the_lanes_that_follow_it(make_engine):
+    def check(item):
+        if item == "bad":
+            raise ValueError("no")
+        return item
+
+    with Dag("lanes_fail", prompt="p", auto_evaluate=False) as dag:
+        src = Task("src", fn=lambda: ["good", "bad"], fan_out=True)
+        first = Task("first", fn=check)
+        then = Task("then", fn=lambda x: f"then {x}", follow_mapping=True)
+        join = Task("join", fn=lambda d: d)
+        src >> first >> then >> join
+    engine = make_engine()
+    engine.register(dag)
+    async with engine:
+        run = await engine.run("lanes_fail", timeout=5)
+    s = {i: inst.status.value for i, inst in run.instances.items()}
+    assert s["first_1"] == "failed" and s["then_1"] == "upstream_failed"
+    assert s["then_0"] == "success" and run.outputs()["then_0"] == "then good"  # the good lane carries on
+    assert s["join"] == "upstream_failed" and run.status == RunStatus.FAILED  # a join over a failed lane doesn't run

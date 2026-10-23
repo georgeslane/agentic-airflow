@@ -754,8 +754,14 @@ class Engine:
             inst.finished_at = time.time()
             self._register_instance(run, node, inst)
 
+        broken = (TaskStatus.FAILED, TaskStatus.UPSTREAM_FAILED)
         if node.trigger_rule == "none_failed":
-            failed = [i for insts in up_insts.values() for i in insts if i.status in (TaskStatus.FAILED, TaskStatus.UPSTREAM_FAILED)]
+            # A failed lane of a mapped upstream that this node follows fails only its own lane (below); any other
+            # failure upstream, a join over failed lanes among them, fails the whole node.
+            failed = [
+                i for insts in up_insts.values() for i in insts
+                if i.status in broken and not (node.follow_mapping and i.map_path)
+            ]
             if failed:
                 placeholder(TaskStatus.UPSTREAM_FAILED, f"upstream failed: {failed[0].instance_id}")
                 return
@@ -813,6 +819,7 @@ class Engine:
 
         for path, bindings, depends in lanes:
             skip_reason: str | None = None
+            fail_reason: str | None = None
             lane_up_status: list[TaskStatus] = []
             for u in ups:
                 if u.id in bindings:
@@ -830,6 +837,8 @@ class Engine:
                 else:
                     depends.append(vi.instance_id)
                     lane_up_status.append(vi.status)
+                    if vi.status in broken:
+                        fail_reason = fail_reason or f"upstream failed: {vi.instance_id}"
                     if vi.status == TaskStatus.SUCCESS:
                         if u in ctx_ops:
                             bindings[u.id] = ("output", vi.instance_id)
@@ -853,7 +862,11 @@ class Engine:
                 skip_reason = skip_reason or "all upstream tasks were skipped"
             inst_id = node.id if not path else node.id + "_" + "_".join(str(p) for p in path)
             inst = TaskInstance(instance_id=inst_id, task_id=node.id, map_path=path, depends_on=list(dict.fromkeys(depends)), bindings=bindings)
-            if skip_reason and node.trigger_rule == "none_failed":
+            if fail_reason and node.trigger_rule == "none_failed":
+                inst.status = TaskStatus.UPSTREAM_FAILED
+                inst.reason = fail_reason
+                inst.finished_at = time.time()
+            elif skip_reason and node.trigger_rule == "none_failed":
                 inst.status = TaskStatus.SKIPPED
                 inst.reason = skip_reason
                 inst.finished_at = time.time()
