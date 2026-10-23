@@ -13,7 +13,15 @@ import os
 import sqlite3
 import threading
 import time
-from typing import Any, Iterable, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable, Protocol, runtime_checkable
+
+from .errors import ConfigurationError
+
+# The SQLite store's layout, as PRAGMA user_version. A change to it, or to how runs are kept in it, adds a step to
+# MIGRATIONS, from the version before: a file is upgraded when it's opened, and a newer one than this is refused,
+# rather than misread.
+SCHEMA = 1
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {}  # version -> the step up to it from the last
 
 
 @runtime_checkable
@@ -197,6 +205,27 @@ class SqliteStateStore(InMemoryStateStore):
         )
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_scope ON documents(collection, scope, status)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_scope2 ON documents(collection, scope2)")
+        self._upgrade()
+
+    def _upgrade(self) -> None:
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0] or 1  # files from before versions are 1
+        if version > SCHEMA:
+            self._conn.close()
+            raise ConfigurationError(
+                f"{self.path} was written by a newer agentic-airflow (schema {version}; this one knows {SCHEMA}): "
+                "upgrade agentic-airflow to open it"
+            )
+        for step in range(version + 1, SCHEMA + 1):
+            with self._lock:
+                self._conn.execute("BEGIN")
+                try:
+                    MIGRATIONS[step](self._conn)
+                    self._conn.execute(f"PRAGMA user_version = {step}")
+                    self._conn.execute("COMMIT")
+                except BaseException:
+                    self._conn.execute("ROLLBACK")
+                    raise
+        self._conn.execute(f"PRAGMA user_version = {SCHEMA}")
 
     def close(self) -> None:
         with self._lock:

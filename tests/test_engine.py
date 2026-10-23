@@ -595,6 +595,37 @@ async def test_sqlite_persistence_memory_and_resume(tmp_path, backend, tools):
     store.close()
 
 
+def test_sqlite_store_keeps_its_schema_version(tmp_path, monkeypatch):
+    import sqlite3
+
+    from agentic_airflow import state as state_module
+    from agentic_airflow.errors import ConfigurationError
+    from agentic_airflow.run import DagRun
+
+    db = tmp_path / "state.db"
+    old = sqlite3.connect(db)  # a file from before versions: user_version 0
+    old.execute("CREATE TABLE documents (collection TEXT NOT NULL, key TEXT NOT NULL, scope TEXT, scope2 TEXT, status TEXT, created_at REAL, updated_at REAL NOT NULL, value TEXT NOT NULL, PRIMARY KEY (collection, key))")
+    old.close()
+    store = SqliteStateStore(db)
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == state_module.SCHEMA
+    # a run kept by another version: a log entry with a field this one doesn't know, and one without some it does
+    run = {"run_id": "r", "dag_id": "d", "log": [{"timestamp": 1.0, "task_id": "a", "instance_id": "a", "status": "success", "later": 1}, {"task_id": "b"}]}
+    store.save_run(run)
+    assert [e.task_id for e in DagRun.from_dict(store.get_run("r")).log] == ["a", "b"]
+    store.close()
+
+    # an upgrade step runs once, in order; a file from a newer version is refused, not misread
+    ran = []
+    monkeypatch.setattr(state_module, "SCHEMA", 2)
+    monkeypatch.setitem(state_module.MIGRATIONS, 2, lambda conn: ran.append(2))
+    SqliteStateStore(db).close()
+    SqliteStateStore(db).close()
+    assert ran == [2]
+    monkeypatch.setattr(state_module, "SCHEMA", 1)
+    with pytest.raises(ConfigurationError, match="newer agentic-airflow"):
+        SqliteStateStore(db)
+
+
 @pytest.mark.asyncio
 async def test_cancel_run(make_engine):
     started = asyncio.Event()

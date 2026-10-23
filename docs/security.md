@@ -10,11 +10,13 @@
 
 **Webhooks** are HMAC-SHA256 signed when a secret is configured, compared in constant time, with a size limit. Unsigned webhooks are allowed only if you choose not to set a secret.
 
-**HTTP server**: loopback by default, bearer-token auth, refuses to bind externally without a token, CSP with nonces, no inline event handlers, all user/model text rendered via `textContent`, request bodies capped at 2 MB.
+**HTTP server**: loopback by default, bearer-token auth, refuses to bind externally without a token, CSP with nonces, no inline event handlers, all user/model text rendered via `textContent`, request bodies capped at 2 MB. Pages in the same browser can't use it: without a token it only answers loopback names (so DNS rebinding fails), cross-origin POSTs are refused, the API only takes JSON, and a page's `?token=` becomes a `SameSite=Strict` cookie rather than staying in the address.
 
 **Skill files** are loaded only from the given directory (symlinks escaping it are ignored). Skill rewrites proposed by the DagEvaluator become active only after `approve_recommendation()`.
 
-**Agent self-modification is proposal-only.** The optional MCP server and `agentic_airflow.proposals` let agents read everything and *propose* prompt, permission, skill and memory changes; they are stored as pending recommendations and only `Engine.approve_recommendation()` (a human, via code or the UI) applies them. The MCP server has no approve/decide/cancel tools, cannot trigger runs unless explicitly enabled, and agents can only withdraw their own proposals.
+**Agent self-modification is proposal-only.** The optional MCP server and `agentic_airflow.proposals` let agents read everything and *propose* prompt, permission, skill and memory changes; they are stored as pending recommendations and only `Engine.approve_recommendation()` (a human, via code or the UI) applies them. The MCP server has no approve/decide/cancel tools, cannot trigger runs unless explicitly enabled, and each client can only withdraw its own proposals. At most 20 proposals from one source wait at a time.
+
+**Stored state is versioned.** `SqliteStateStore` records its schema in the file, upgrades older files when it opens them, and refuses one written by a newer version rather than misread it.
 
 **Human approval gates**: denied tool calls, exhausted reflection loops, and every DagEvaluator change to permissions, prompts or skills. Memory compaction is applied automatically by default because it does not change behaviourally-privileged configuration; set `DagEvaluator(apply_memory=False)` to gate it too.
 

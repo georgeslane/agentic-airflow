@@ -175,6 +175,15 @@ class RunLogEntry:
     error: str | None = None
     attempt: int = 1
 
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "RunLogEntry":
+        """An entry as stored, by any version: fields it doesn't know are left out, missing ones take defaults."""
+        known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        known.setdefault("timestamp", 0.0)
+        for name in ("task_id", "instance_id", "status"):
+            known.setdefault(name, "")
+        return cls(**known)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "timestamp": self.timestamp,
@@ -269,7 +278,7 @@ class DagRun:
             node_instances={k: list(v) for k, v in (d.get("node_instances") or {}).items()},
             expanded=list(d.get("expanded") or []),
             done_nodes=list(d.get("done_nodes") or []),
-            log=[RunLogEntry(**e) for e in d.get("log") or []],
+            log=[RunLogEntry.from_dict(e) for e in d.get("log") or []],
             chat_log=list(d.get("chat_log") or []),
             error=d.get("error"),
             approved_tools=list(d.get("approved_tools") or []),
