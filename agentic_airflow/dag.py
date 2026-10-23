@@ -18,7 +18,7 @@ _MAP_SUFFIX_RE = re.compile(r"^(?P<base>.+?)(?:_\d+)+$")
 class TaskGroup:
     """Scoped organisational container applying shared configuration.
 
-    Accepts ``id``, ``model``, ``allowed_tools``, ``denied_tools``,
+    Accepts ``id``, ``model``, ``enabled``, ``automated``, ``allowed_tools``, ``denied_tools``,
     ``hidden_tools``, ``skills``, ``inherit_skills``, ``thinking``,
     ``max_tool_steps``, ``retries``, ``retry_delay`` and ``ask_user``. Use as a
     context manager::
@@ -42,6 +42,8 @@ class TaskGroup:
         allowed_tools: list[str] | None = None,
         denied_tools: list[str] | None = None,
         hidden_tools: list[str] | None = None,
+        enabled: list[str] | str | None = None,
+        automated: list[str] | str | None = None,
         skills: list[str] | None = None,
         inherit_skills: bool = True,
         thinking: Thinking | None = None,
@@ -63,6 +65,8 @@ class TaskGroup:
             allowed_tools=allowed_tools,
             denied_tools=denied_tools,
             hidden_tools=hidden_tools,
+            enabled=enabled,  # type: ignore[arg-type]
+            automated=automated,  # type: ignore[arg-type]
             max_tool_steps=max_tool_steps,
             retries=retries,
             retry_delay=retry_delay,
@@ -226,6 +230,8 @@ class Dag:
         allowed_tools: list[str] | None = None,
         denied_tools: list[str] | None = None,
         hidden_tools: list[str] | None = None,
+        enabled: list[str] | str | None = None,
+        automated: list[str] | str | None = None,
         skills: list[str] | None = None,
         inherit_skills: bool = True,
         thinking: Thinking | None = None,
@@ -265,6 +271,8 @@ class Dag:
             allowed_tools=allowed_tools,
             denied_tools=denied_tools,
             hidden_tools=hidden_tools,
+            enabled=enabled,  # type: ignore[arg-type]
+            automated=automated,  # type: ignore[arg-type]
             max_tool_steps=max_tool_steps,
             retries=retries,
             retry_delay=retry_delay,

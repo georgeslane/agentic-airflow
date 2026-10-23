@@ -65,6 +65,7 @@ Unselected downstream nodes and their *exclusive* descendants are `SKIPPED`. Joi
 | Parameter | Default | Notes |
 |---|---|---|
 | `model` | inherit | Model id handed to the backend. |
+| `enabled` / `automated` | inherit (the nearest list) | The tools it can use at all, and which of those that ask first run without asking; `"*"` is every tool. See [Enabled and automated tools](#enabled-and-automated-tools). |
 | `allowed_tools` / `denied_tools` / `hidden_tools` | inherit / additive / additive | See [tool governance](#tool-governance). |
 | `skills` / `inherit_skills` | `None` / `True` | Skill names rendered into the system prompt. |
 | `thinking` | inherit (`"off"`) | `"on"`/`"off"` → `GenerationRequest.thinking`. |
@@ -93,6 +94,23 @@ Resolution per task (`tools.resolve_permissions`):
 * Anything registered but not allowed is **denied**: calling it serialises the conversation, puts the instance in `AWAITING_TOOL_APPROVAL`, releases the model slot and creates an `Approval`. `engine.approve(id, remember=True)` executes it (and allows it for the rest of the run); `engine.reject(id, reason)` injects a denial message so the agent adjusts.
 * Unknown (unregistered) tool names produce an error message to the model, not a pause.
 * Tool arguments are validated against the tool's JSON schema before execution.
+
+### Enabled and automated tools
+
+Once any scope (the engine's, the DAG's, a group's or the task's) sets `enabled`, the task's tools are decided by two lists, each taken from the nearest scope that sets it, as patterns, with `"*"` for every tool:
+
+* **`enabled`**: the tools the task can use at all. Anything else isn't offered, can't be found with `search_tools`, and a call to it fails with an error the model reads, rather than pausing: no human is asked. Approving a tool for the rest of the run doesn't give it to a task it isn't enabled for.
+* **`automated`**: of the enabled tools registered with `approval="ask"`, those that run without asking. Automating a tool doesn't enable it, so a broad `automated` on the DAG never gives a narrow task more tools. Tools registered with `approval="none"` run without asking wherever they're enabled, and `approval="always"` ones always ask.
+
+`denied_tools` still take tools away, and `hidden_tools` make enabled ones on-demand; `allowed_tools` no longer counts. With no `enabled` anywhere, permissions are as described above.
+
+```python
+with Dag("checks", prompt="Tell me what's new", enabled=[]):          # by default, no tools
+    emails = AgenticTask("emails", prompt="Read today's emails.", enabled=["email_*"])
+    notify = AgenticTask("notify", prompt="Say what's new.")          # given none: it works from what came before
+    reply = AgenticTask("reply", prompt="Reply.", enabled=["send_email"], automated=["send_email"])
+    emails >> notify >> reply
+```
 
 ### Asking a human
 

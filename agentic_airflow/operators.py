@@ -331,6 +331,8 @@ class AgenticTask(BaseOperator):
         allowed_tools: list[str] | None = None,
         denied_tools: list[str] | None = None,
         hidden_tools: list[str] | None = None,
+        enabled: list[str] | str | None = None,
+        automated: list[str] | str | None = None,
         skills: list[str] | None = None,
         inherit_skills: bool = True,
         thinking: Thinking | None = None,
@@ -371,6 +373,8 @@ class AgenticTask(BaseOperator):
             allowed_tools=allowed_tools,
             denied_tools=denied_tools,
             hidden_tools=hidden_tools,
+            enabled=enabled,  # type: ignore[arg-type]
+            automated=automated,  # type: ignore[arg-type]
             max_tool_steps=max_tool_steps,
             retries=retries,
             retry_delay=retry_delay,

@@ -345,8 +345,14 @@ async def run_agentic_instance(
                 save_checkpoint({"calls": [c.to_dict() for c in calls], "index": index, "decision": None})
                 return {"tool_call": call.to_dict(), "reason": "question", **asked}
             state = perms.state(call.name, registered=call.name in registry)
-            if call.name == SEARCH_TOOL_NAME or (call.name in run.approved_tools and call.name not in perms.always):
+            remembered = call.name in run.approved_tools and call.name not in perms.always
+            if call.name == SEARCH_TOOL_NAME or (remembered and (call.name in perms.offered or not perms.refuse_denied)):
                 state = "allowed"
+            if state == "denied" and perms.refuse_denied:  # not one of the task's tools: no one's asked
+                text = f"Error: {call.name} isn't one of the tools this task can use. Do without it."
+                messages.append(Message(role="tool", name=call.name, tool_call_id=call.id, content=text))
+                inst.tool_calls.append({"id": call.id, "name": call.name, "arguments": call.arguments, "status": "error", "result": text, "step": tool_steps})
+                continue
             if state in ("denied", "gated"):
                 pending_state = {"calls": [c.to_dict() for c in calls], "index": index, "decision": None}
                 save_checkpoint(pending_state)
