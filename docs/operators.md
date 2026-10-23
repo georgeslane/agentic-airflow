@@ -102,7 +102,7 @@ Once any scope (the engine's, the DAG's, a group's or the task's) sets `enabled`
 * **`enabled`**: the tools the task can use at all. Anything else isn't offered, can't be found with `search_tools`, and a call to it fails with an error the model reads, rather than pausing: no human is asked. Approving a tool for the rest of the run doesn't give it to a task it isn't enabled for.
 * **`automated`**: of the enabled tools registered with `approval="ask"`, those that run without asking. Automating a tool doesn't enable it, so a broad `automated` on the DAG never gives a narrow task more tools. Tools registered with `approval="none"` run without asking wherever they're enabled, and `approval="always"` ones always ask.
 
-`denied_tools` still take tools away, and `hidden_tools` make enabled ones on-demand; `allowed_tools` no longer counts. With no `enabled` anywhere, permissions are as described above.
+A tool registered with the tag `"explicit"` is enabled only by its own name, never by `"*"` or another pattern: for a tool only a few tasks should have. `denied_tools` still take tools away, and `hidden_tools` make enabled ones on-demand; `allowed_tools` no longer counts. With no `enabled` anywhere, permissions are as described above.
 
 ```python
 with Dag("checks", prompt="Tell me what's new", enabled=[]):          # by default, no tools

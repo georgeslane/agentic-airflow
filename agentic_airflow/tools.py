@@ -35,6 +35,7 @@ from .validation import schema_errors
 
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 SEARCH_TOOL_NAME = "search_tools"
+EXPLICIT = "explicit"  # a tool's tag: enabled only by its name, never by a pattern (resolve_permissions)
 
 ToolState = Literal["allowed", "hidden", "gated", "denied", "unknown"]
 Approval = Literal["none", "ask", "always"]
@@ -413,9 +414,11 @@ def _enabled(
     """Permissions once a scope sets ``enabled``: a task can use only the tools it names, less ``denied_tools``,
     and nothing else is offered, found or run, even with approval. Of those, a tool that asks first runs without
     asking if ``automated`` names it (or an ``allow`` override does); one that always asks always does; the rest
-    run without asking. Automating a tool doesn't enable it."""
+    run without asking. Automating a tool doesn't enable it. A tool tagged ``"explicit"`` is enabled only by its
+    name, never by a pattern such as ``"*"``: one for a few tasks alone."""
     allow = matching(overrides.get("allow") or [])
-    usable = (matching(config.enabled or []) | allow) - matching([*config.denied_tools, *(overrides.get("deny") or [])])
+    enabled = {n for n in matching(config.enabled or []) if EXPLICIT not in tools[n].tags or n in (config.enabled or [])}
+    usable = (enabled | allow) - matching([*config.denied_tools, *(overrides.get("deny") or [])])
     automated = matching(config.automated) | allow
     allowed: set[str] = set()
     gated: set[str] = set()

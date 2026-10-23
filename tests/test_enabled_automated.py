@@ -42,6 +42,22 @@ def test_the_nearest_list_decides():
     assert _perms(dag, {"automated": []}).gated == {"send_email", "push"}
 
 
+def test_a_tool_tagged_explicit_is_enabled_only_by_its_name():
+    from agentic_airflow import tool
+
+    registry = _registry()
+
+    @tool(description="For one task alone", tags=("explicit",))
+    def propose(text: str) -> str:
+        return text
+
+    registry.register(propose)
+    scope = lambda enabled: resolve_config([ScopeConfig(enabled=enabled)])  # noqa: E731
+    assert "propose" not in resolve_permissions(scope("*"), registry).offered
+    assert "propose" not in resolve_permissions(scope(["prop*"]), registry).offered
+    assert "propose" in resolve_permissions(scope(["propose"]), registry).offered
+
+
 def test_hidden_tools_are_found_only_among_those_enabled():
     perms = _perms({"enabled": ["send_email"], "hidden_tools": ["*"]})
     assert perms.hidden == {"send_email"} and perms.visible == frozenset()
