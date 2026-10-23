@@ -330,8 +330,8 @@ class Engine:
                 await driver
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-        else:
-            self._finalize(run, RunStatus.CANCELLED)
+        # A driver cancelled before it began never ran its own clean-up.
+        self._finalize(run, RunStatus.CANCELLED)
         return run
 
     async def resume(self, run_id: str) -> DagRun:

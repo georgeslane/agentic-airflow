@@ -217,3 +217,25 @@ async def test_user_slot_waits_for_the_running_task(make_engine, backend):
             order.append("user")
         await engine.wait(run.run_id, timeout=5)
     assert order == ["task", "user"]
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_run_that_has_only_just_started_cancels_it(make_engine, backend):
+    gate = asyncio.Event()
+
+    async def hold(req):
+        await gate.wait()
+        return "ok"
+
+    backend.default = hold
+    engine = make_engine()
+    engine.register(_dag("d"))
+    async with engine:
+        first = await engine.trigger("d")
+        second = await engine.trigger("d")  # waits for the first
+        await asyncio.sleep(0.05)
+        await engine.cancel(first.run_id)  # the second starts...
+        await engine.cancel(second.run_id)  # ...and is cancelled before its driver has run
+        assert engine.get_run(second.run_id).status == RunStatus.CANCELLED
+        assert engine.runs == {}
+        gate.set()
